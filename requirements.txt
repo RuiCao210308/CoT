@@ -1,6 +1,6 @@
 # Base ----------------------------------------
-torch>=1.8.1
-torchvision>=0.9.1
+torch>=2.3.0
+torchvision>=0.18.0
 accelerate
 flash-attn
 matplotlib>=3.2.2
@@ -15,9 +15,9 @@ gdown
 flask
 Werkzeug
 argparse
-transformers>=4.46.2  # for Mllama
+transformers>=4.49.0  # Qwen2.5-VL + Mllama
 ultralytics
-qwen_vl_utils
+qwen-vl-utils>=0.0.8
 pyquaternion
 nuscenes-devkit
 openai

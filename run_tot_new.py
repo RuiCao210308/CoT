@@ -22,6 +22,8 @@ import os
 import re
 import json
 import argparse
+import yaml
+import base64
 from datetime import datetime
 from math import atan2
 import pandas as pd
@@ -67,6 +69,21 @@ TOT_CANDIDATE_INTENTS = [
 # ------------------------------------------------
 # 基础工具函数
 # ------------------------------------------------
+
+
+def load_yaml_config(config_path):
+    if not config_path:
+        return {}
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data
+
+
+def cfg_get(config, section, key, fallback):
+    return config.get(section, {}).get(key, config.get("common", {}).get(key, fallback))
+
 def parse_speed_curvature_text(raw_text, max_len=FUT_LEN):
     """
     从模型输出中解析 [v, k] 序列。
@@ -154,7 +171,7 @@ def pretty_print_step(
     print(f"First-step Δv={dv:.3f}, Δk={dk:.3f}")
     #print("=" * 60)
 
-def average_predictions(pred_list):
+def average_predictions(pred_list, mode="mean", trim_ratio=0.1, weights=None):
     """
     将多次 [T,2] 预测做数值 Self-Consistency 平均。
     pred_list: List[np.ndarray(T,2)]
@@ -166,7 +183,71 @@ def average_predictions(pred_list):
     if min_len == 0:
         return None
     stacked = np.stack([p[:min_len] for p in pred_list], axis=0)  # [N,T,2]
+
+    if mode == "mean":
+        return stacked.mean(axis=0)
+    if mode == "median":
+        return np.median(stacked, axis=0)
+    if mode == "trimmed_mean":
+        n = stacked.shape[0]
+        k = int(np.floor(n * trim_ratio))
+        if n <= 2 * k:
+            return stacked.mean(axis=0)
+        sorted_stack = np.sort(stacked, axis=0)
+        return sorted_stack[k:n-k].mean(axis=0)
+    if mode == "weighted":
+        if weights is None or len(weights) != stacked.shape[0]:
+            return stacked.mean(axis=0)
+        w = np.array(weights, dtype=np.float32)
+        w = np.maximum(w, 1e-6)
+        w = w / w.sum()
+        return (stacked * w[:, None, None]).sum(axis=0)
     return stacked.mean(axis=0)
+
+
+def infer_dynamic_tot_intents(obs_velocities, obs_curvatures, max_candidates=8):
+    """
+    根据近期速度/曲率统计动态生成候选意图，减少固定模板带来的场景失配。
+    """
+    speed = np.linalg.norm(obs_velocities, axis=1)
+    curv = obs_curvatures
+    speed_last = float(speed[-1])
+    speed_delta = float(speed[-1] - speed[0])
+    curv_last = float(curv[-1])
+    curv_abs_mean = float(np.mean(np.abs(curv)))
+
+    intents = list(TOT_CANDIDATE_INTENTS)
+
+    if speed_last < 2.0:
+        intents.extend([
+            "drive cautiously with very low speed and prepare for stop/go traffic",
+            "keep near-stop behavior and prioritize safety gap before moving",
+        ])
+    elif speed_last > 8.0:
+        intents.extend([
+            "maintain speed with gentle control and avoid abrupt braking",
+            "slightly decelerate to improve comfort while maintaining lane center",
+        ])
+
+    if speed_delta > 1.0:
+        intents.append("continue mild acceleration only if lane ahead is clear")
+    elif speed_delta < -1.0:
+        intents.append("continue controlled deceleration and keep conservative headway")
+
+    if curv_abs_mean > 0.03:
+        if curv_last > 0:
+            intents.append("follow a smooth left-turn profile with reduced jerk")
+        else:
+            intents.append("follow a smooth right-turn profile with reduced jerk")
+    else:
+        intents.append("stabilize curvature near zero and keep straight lane tracking")
+
+    # 去重并裁剪
+    dedup = []
+    for item in intents:
+        if item not in dedup:
+            dedup.append(item)
+    return dedup[:max_candidates]
 
 
 def physical_score_candidate(speed_curv, last_speed, last_curv):
@@ -203,7 +284,28 @@ def physical_score_candidate(speed_curv, last_speed, last_curv):
     # 初始偏差惩罚
     consis = np.exp(-(diff_v0 / 3.0 + diff_k0 / 1.0))
 
-    score = smooth_v + smooth_k + consis + v_penalty
+    # jerk/曲率 jerk 舒适性
+    jerk_v = np.abs(np.diff(v, n=2)).mean() if len(v) > 2 else 0.0
+    jerk_k = np.abs(np.diff(k, n=2)).mean() if len(k) > 2 else 0.0
+    comfort = np.exp(-(jerk_v / 2.5 + jerk_k / 0.3))
+
+    # 安全代理：高曲率+高速度组合惩罚（简化离线 proxy）
+    safety_proxy = np.exp(-np.mean(np.abs(v * k)) / 0.8)
+
+    # 规则代理：鼓励整体平稳前进，避免负速度
+    non_negative = np.mean(v >= -0.1)
+    progress = np.exp(-np.maximum(0.0, -v.mean()) / 0.5)
+
+    score = (
+        0.8 * smooth_v
+        + 0.8 * smooth_k
+        + 1.0 * consis
+        + 0.8 * comfort
+        + 0.7 * safety_proxy
+        + 0.4 * non_negative
+        + 0.5 * progress
+        + v_penalty
+    )
     return float(score)
 
 
@@ -457,6 +559,7 @@ def predict_with_sc(obs_images, obs_velocities, obs_curvatures,
                     processor, model, tokenizer, args,
                     sc_samples=5):
     preds = []
+    pred_scores = []
     first_scene = first_obj = first_intent = None
 
     for i in range(sc_samples):
@@ -468,13 +571,18 @@ def predict_with_sc(obs_images, obs_velocities, obs_curvatures,
         arr = parse_speed_curvature_text(raw)
         if arr is not None:
             preds.append(arr)
+            _, last_v, last_k = format_obs_speed_curvature(obs_velocities, obs_curvatures)
+            pred_scores.append(max(1e-6, physical_score_candidate(arr, last_v, last_k)))
             if first_scene is None:
                 first_scene, first_obj, first_intent = scene_desc, obj_desc, intent_desc
 
     if not preds:
         return None, None, None, None
 
-    mean_pred = average_predictions(preds)
+    agg_mode = args.sc_agg
+    if agg_mode == "trimmed":
+        agg_mode = "trimmed_mean"
+    mean_pred = average_predictions(preds, mode=agg_mode, weights=pred_scores)
     return mean_pred, first_scene, first_obj, first_intent
 
 
@@ -486,7 +594,7 @@ def predict_with_tot(obs_images, obs_velocities, obs_curvatures,
       - 每个分支调用一次 generate_motion_single
       - 用物理启发式打分，选得分最高的那条预测
     """
-    obs_speed_curvature_str, last_v, last_k = format_obs_speed_curvature(
+    _, last_v, last_k = format_obs_speed_curvature(
         obs_velocities, obs_curvatures
     )
 
@@ -494,24 +602,29 @@ def predict_with_tot(obs_images, obs_velocities, obs_curvatures,
     best_pred = None
     best_scene = best_obj = best_intent = None
 
-    for intent_hint in TOT_CANDIDATE_INTENTS:
+    candidate_intents = infer_dynamic_tot_intents(
+        obs_velocities,
+        obs_curvatures,
+        max_candidates=args.tot_branches,
+    )
+    for intent_hint in candidate_intents:
         extra_text = f"Assume the driver intent is: {intent_hint}."
-        raw, scene_desc, obj_desc, intent_desc = generate_motion_single(
-            obs_images, obs_velocities, obs_curvatures,
-            processor=processor, model=model, tokenizer=tokenizer, args=args,
-            extra_intent_text=extra_text,
-            temperature=0.9, top_p=0.9
-        )
-        arr = parse_speed_curvature_text(raw)
-        if arr is None:
-            continue
-        score = physical_score_candidate(arr, last_v, last_k)
-        print(f"[ToT] intent='{intent_hint}' score={score:.3f}")
-        if score > best_score:
-            best_score = score
-            best_pred = arr
-            best_scene, best_obj, best_intent = scene_desc, obj_desc, intent_desc
-        print(best_pred)
+        for _ in range(args.tot_samples_per_branch):
+            raw, scene_desc, obj_desc, intent_desc = generate_motion_single(
+                obs_images, obs_velocities, obs_curvatures,
+                processor=processor, model=model, tokenizer=tokenizer, args=args,
+                extra_intent_text=extra_text,
+                temperature=0.9, top_p=0.9
+            )
+            arr = parse_speed_curvature_text(raw)
+            if arr is None:
+                continue
+            score = physical_score_candidate(arr, last_v, last_k)
+            print(f"[ToT] intent='{intent_hint}' score={score:.3f}")
+            if score > best_score:
+                best_score = score
+                best_pred = arr
+                best_scene, best_obj, best_intent = scene_desc, obj_desc, intent_desc
     if best_pred is None:
         return None, None, None, None
     return best_pred, best_scene, best_obj, best_intent
@@ -526,25 +639,39 @@ def load_model_from_args(args):
     tokenizer = None
 
     if "qwen" in args.model_path or "Qwen" in args.model_path:
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-        os.environ["HF_HOME"] = "/home/Cr_seu0321/.cache/huggingface"
-        os.environ["HUGGINGFACE_HUB_CACHE"] = "/home/Cr_seu0321/.cache/huggingface"
-        os.environ["TRANSFORMERS_CACHE"] = "/home/Cr_seu0321/.cache/huggingface"
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        LOCAL_ID = "/home/Cr_seu0321/.cache/huggingface/hub/models--Qwen--Qwen2-VL-7B-Instruct/snapshots/eed13092ef92e448dd6875b2a00151bd3f7db0ac"
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    LOCAL_ID,
-                    local_files_only=True,
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto",
-                    )           
+        from transformers import AutoProcessor
+        try:
+            from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLModel
+        except ImportError:
+            from transformers import Qwen2VLForConditionalGeneration as QwenVLModel
+
+        if args.hf_cache_dir:
+            os.environ["HF_HOME"] = args.hf_cache_dir
+            os.environ["HUGGINGFACE_HUB_CACHE"] = args.hf_cache_dir
+            os.environ["TRANSFORMERS_CACHE"] = args.hf_cache_dir
+        if args.offline:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+        model_kwargs = {
+            "torch_dtype": dtype,
+            "device_map": args.device_map,
+            "attn_implementation": args.attn_implementation,
+            "local_files_only": args.offline,
+        }
+        if args.max_memory:
+            model_kwargs["max_memory"] = {0: args.max_memory}
+
+        model = QwenVLModel.from_pretrained(args.qwen_model_id, **model_kwargs)
         processor = AutoProcessor.from_pretrained(
-                            LOCAL_ID,
-                            local_files_only=True
-                    )
+            args.qwen_model_id,
+            local_files_only=args.offline,
+        )
         tokenizer = None
         return model, processor, tokenizer
+
+    raise ValueError(f"Unsupported model_path: {args.model_path}")
 
 # ------------------------------------------------
 # 主评估循环
@@ -802,23 +929,47 @@ def main_loop(args, model, processor, tokenizer):
 # 入口
 # ------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="qwen",
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default="configs/base.yaml")
+    pre_args, _ = pre_parser.parse_known_args()
+    config = load_yaml_config(pre_args.config)
+
+    parser = argparse.ArgumentParser(parents=[pre_parser])
+    parser.add_argument("--model-path", type=str, default=cfg_get(config, "run_tot_new", "model_path", "qwen"),
                         help="qwen / gpt / (llava: 需要你自己补全)")
-    parser.add_argument("--dataroot", type=str, default="/home/Cr_seu0321/data/nuscenes")
-    parser.add_argument("--version", type=str, default="v1.0-mini")
-    parser.add_argument("--plot", type=lambda x: str(x).lower() == "true", default=True)
-    parser.add_argument("--method", type=str, default="cot",
+    parser.add_argument("--qwen-model-id", type=str, default=cfg_get(config, "run_tot_new", "qwen_model_id", "Qwen/Qwen2.5-VL-7B-Instruct"),
+                        help="HF model id or local path for Qwen-VL model")
+    parser.add_argument("--hf-cache-dir", type=str, default=cfg_get(config, "run_tot_new", "hf_cache_dir", ""),
+                        help="HuggingFace cache dir, recommended on A800 server")
+    parser.add_argument("--offline", type=lambda x: str(x).lower() == "true", default=cfg_get(config, "run_tot_new", "offline", False),
+                        help="load model in offline mode")
+    parser.add_argument("--dtype", type=str, default=cfg_get(config, "run_tot_new", "dtype", "bfloat16"), choices=["bfloat16", "float16"])
+    parser.add_argument("--device-map", type=str, default=cfg_get(config, "run_tot_new", "device_map", "auto"))
+    parser.add_argument("--attn-implementation", type=str, default=cfg_get(config, "run_tot_new", "attn_implementation", "flash_attention_2"),
+                        choices=["flash_attention_2", "sdpa", "eager"])
+    parser.add_argument("--max-memory", type=str, default=cfg_get(config, "run_tot_new", "max_memory", ""),
+                        help="e.g. 75GiB for A800 single card")
+    parser.add_argument("--dataroot", type=str, default=cfg_get(config, "common", "dataroot", "datasets/NuScenes"))
+    parser.add_argument("--version", type=str, default=cfg_get(config, "common", "version", "v1.0-mini"))
+    parser.add_argument("--plot", type=lambda x: str(x).lower() == "true", default=cfg_get(config, "common", "save_visualization", True))
+    parser.add_argument("--method", type=str, default=cfg_get(config, "run_tot_new", "method", "cot"),
                         choices=["cot", "sc", "tot"],
                         help="cot: baseline; sc: self-consistency; tot: tree-of-thought")
-    parser.add_argument("--sc-samples", type=int, default=5,
+    parser.add_argument("--sc-samples", type=int, default=cfg_get(config, "run_tot_new", "sc_samples", 5),
                         help="self-consistency 采样次数")
+    parser.add_argument("--sc-agg", type=str, default=cfg_get(config, "run_tot_new", "sc_agg", "trimmed"),
+                        choices=["mean", "median", "trimmed", "weighted"],
+                        help="SC aggregation strategy")
+    parser.add_argument("--tot-branches", type=int, default=cfg_get(config, "run_tot_new", "tot_branches", 8),
+                        help="ToT dynamic intent branch count")
+    parser.add_argument("--tot-samples-per-branch", type=int, default=cfg_get(config, "run_tot_new", "tot_samples_per_branch", 2),
+                        help="sampling times for each ToT intent branch")
     parser.add_argument(
-    "--use-tqdm",
-    type=lambda x: str(x).lower() == "true",
-    default=True,
-    help="True: show progress bar only; False: verbose debug output"
-)
+        "--use-tqdm",
+        type=lambda x: str(x).lower() == "true",
+        default=cfg_get(config, "run_tot_new", "use_tqdm", True),
+        help="True: show progress bar only; False: verbose debug output"
+    )
 
     return parser.parse_args()
 

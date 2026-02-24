@@ -1,0 +1,29 @@
+common:
+  dataroot: datasets/NuScenes
+  version: v1.0-mini
+  batch_size: 1
+  num_workers: 2
+  log_interval: 5
+  save_visualization: false
+
+run_tot_new:
+  model_path: qwen
+  qwen_model_id: Qwen/Qwen2.5-VL-7B-Instruct
+  hf_cache_dir: ""
+  offline: false
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: flash_attention_2
+  max_memory: "75GiB"
+  method: sc
+  sc_samples: 5
+  sc_agg: trimmed
+  tot_branches: 8
+  tot_samples_per_branch: 2
+  use_tqdm: true
+
+main:
+  model_path: qwen
+  plot: false
+  method: openemma
+  reasoning_mode: cot
