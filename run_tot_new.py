@@ -22,6 +22,7 @@ import os
 import re
 import json
 import argparse
+import yaml
 import base64
 from datetime import datetime
 from math import atan2
@@ -68,6 +69,21 @@ TOT_CANDIDATE_INTENTS = [
 # ------------------------------------------------
 # 基础工具函数
 # ------------------------------------------------
+
+
+def load_yaml_config(config_path):
+    if not config_path:
+        return {}
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data
+
+
+def cfg_get(config, section, key, fallback):
+    return config.get(section, {}).get(key, config.get("common", {}).get(key, fallback))
+
 def parse_speed_curvature_text(raw_text, max_len=FUT_LEN):
     """
     从模型输出中解析 [v, k] 序列。
@@ -913,42 +929,47 @@ def main_loop(args, model, processor, tokenizer):
 # 入口
 # ------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="qwen",
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default="configs/base.yaml")
+    pre_args, _ = pre_parser.parse_known_args()
+    config = load_yaml_config(pre_args.config)
+
+    parser = argparse.ArgumentParser(parents=[pre_parser])
+    parser.add_argument("--model-path", type=str, default=cfg_get(config, "run_tot_new", "model_path", "qwen"),
                         help="qwen / gpt / (llava: 需要你自己补全)")
-    parser.add_argument("--qwen-model-id", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+    parser.add_argument("--qwen-model-id", type=str, default=cfg_get(config, "run_tot_new", "qwen_model_id", "Qwen/Qwen2.5-VL-7B-Instruct"),
                         help="HF model id or local path for Qwen-VL model")
-    parser.add_argument("--hf-cache-dir", type=str, default="",
+    parser.add_argument("--hf-cache-dir", type=str, default=cfg_get(config, "run_tot_new", "hf_cache_dir", ""),
                         help="HuggingFace cache dir, recommended on A800 server")
-    parser.add_argument("--offline", type=lambda x: str(x).lower() == "true", default=False,
+    parser.add_argument("--offline", type=lambda x: str(x).lower() == "true", default=cfg_get(config, "run_tot_new", "offline", False),
                         help="load model in offline mode")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--device-map", type=str, default="auto")
-    parser.add_argument("--attn-implementation", type=str, default="flash_attention_2",
+    parser.add_argument("--dtype", type=str, default=cfg_get(config, "run_tot_new", "dtype", "bfloat16"), choices=["bfloat16", "float16"])
+    parser.add_argument("--device-map", type=str, default=cfg_get(config, "run_tot_new", "device_map", "auto"))
+    parser.add_argument("--attn-implementation", type=str, default=cfg_get(config, "run_tot_new", "attn_implementation", "flash_attention_2"),
                         choices=["flash_attention_2", "sdpa", "eager"])
-    parser.add_argument("--max-memory", type=str, default="",
+    parser.add_argument("--max-memory", type=str, default=cfg_get(config, "run_tot_new", "max_memory", ""),
                         help="e.g. 75GiB for A800 single card")
-    parser.add_argument("--dataroot", type=str, default="/home/Cr_seu0321/data/nuscenes")
-    parser.add_argument("--version", type=str, default="v1.0-mini")
-    parser.add_argument("--plot", type=lambda x: str(x).lower() == "true", default=True)
-    parser.add_argument("--method", type=str, default="cot",
+    parser.add_argument("--dataroot", type=str, default=cfg_get(config, "common", "dataroot", "datasets/NuScenes"))
+    parser.add_argument("--version", type=str, default=cfg_get(config, "common", "version", "v1.0-mini"))
+    parser.add_argument("--plot", type=lambda x: str(x).lower() == "true", default=cfg_get(config, "common", "save_visualization", True))
+    parser.add_argument("--method", type=str, default=cfg_get(config, "run_tot_new", "method", "cot"),
                         choices=["cot", "sc", "tot"],
                         help="cot: baseline; sc: self-consistency; tot: tree-of-thought")
-    parser.add_argument("--sc-samples", type=int, default=5,
+    parser.add_argument("--sc-samples", type=int, default=cfg_get(config, "run_tot_new", "sc_samples", 5),
                         help="self-consistency 采样次数")
-    parser.add_argument("--sc-agg", type=str, default="trimmed",
+    parser.add_argument("--sc-agg", type=str, default=cfg_get(config, "run_tot_new", "sc_agg", "trimmed"),
                         choices=["mean", "median", "trimmed", "weighted"],
                         help="SC aggregation strategy")
-    parser.add_argument("--tot-branches", type=int, default=8,
+    parser.add_argument("--tot-branches", type=int, default=cfg_get(config, "run_tot_new", "tot_branches", 8),
                         help="ToT dynamic intent branch count")
-    parser.add_argument("--tot-samples-per-branch", type=int, default=2,
+    parser.add_argument("--tot-samples-per-branch", type=int, default=cfg_get(config, "run_tot_new", "tot_samples_per_branch", 2),
                         help="sampling times for each ToT intent branch")
     parser.add_argument(
-    "--use-tqdm",
-    type=lambda x: str(x).lower() == "true",
-    default=True,
-    help="True: show progress bar only; False: verbose debug output"
-)
+        "--use-tqdm",
+        type=lambda x: str(x).lower() == "true",
+        default=cfg_get(config, "run_tot_new", "use_tqdm", True),
+        help="True: show progress bar only; False: verbose debug output"
+    )
 
     return parser.parse_args()
 

@@ -2,6 +2,7 @@ import base64
 import os.path
 import re
 import argparse
+import yaml
 from datetime import datetime
 from math import atan2
 
@@ -18,6 +19,10 @@ import json
 from openemma.YOLO3D.inference import yolo3d_nuScenes
 from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
 from transformers import MllamaForConditionalGeneration, AutoProcessor, Qwen2VLForConditionalGeneration, AutoTokenizer
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except ImportError:
+    Qwen2_5_VLForConditionalGeneration = Qwen2VLForConditionalGeneration
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 from llava.model.builder import load_pretrained_model
@@ -250,17 +255,40 @@ def GenerateMotion(obs_images, obs_waypoints, obs_velocities, obs_curvatures, gi
             break
     return result, scene_description, object_description, intent_description
 
+
+def load_yaml_config(config_path):
+    if not config_path:
+        return {}
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def cfg_get(config, section, key, fallback):
+    return config.get(section, {}).get(key, config.get("common", {}).get(key, fallback))
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="gpt")
-    parser.add_argument("--plot", type=bool, default=True)
-    parser.add_argument("--dataroot", type=str, default='datasets/NuScenes')
-    parser.add_argument("--version", type=str, default='v1.0-mini')
-    parser.add_argument("--method", type=str, default='openemma')
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default="configs/base.yaml")
+    pre_args, _ = pre_parser.parse_known_args()
+    config = load_yaml_config(pre_args.config)
+
+    parser = argparse.ArgumentParser(parents=[pre_parser])
+    parser.add_argument("--model-path", type=str, default=cfg_get(config, "main", "model_path", "gpt"))
+    parser.add_argument("--plot", type=lambda x: str(x).lower() == "true", default=cfg_get(config, "main", "plot", cfg_get(config, "common", "save_visualization", True)))
+    parser.add_argument("--dataroot", type=str, default=cfg_get(config, "common", "dataroot", 'datasets/NuScenes'))
+    parser.add_argument("--version", type=str, default=cfg_get(config, "common", "version", 'v1.0-mini'))
+    parser.add_argument("--method", type=str, default=cfg_get(config, "main", "method", 'openemma'))
     # [新增] 添加推理模式参数，支持cot、cot-sc和tot三种模式
-    parser.add_argument("--reasoning-mode", type=str, default='cot', 
+    parser.add_argument("--reasoning-mode", type=str, default=cfg_get(config, "main", "reasoning_mode", 'cot'), 
                         choices=['cot', 'cot-sc', 'tot'],
                         help='Reasoning mode: cot (Chain of Thought), cot-sc (Chain of Thought with Self-Consistency), tot (Tree of Thoughts)')
+    parser.add_argument("--qwen-model-id", type=str, default=cfg_get(config, "run_tot_new", "qwen_model_id", "Qwen/Qwen2.5-VL-7B-Instruct"))
+    parser.add_argument("--hf-cache-dir", type=str, default=cfg_get(config, "run_tot_new", "hf_cache_dir", ""))
+    parser.add_argument("--offline", type=lambda x: str(x).lower() == "true", default=cfg_get(config, "run_tot_new", "offline", False))
+    parser.add_argument("--dtype", type=str, default=cfg_get(config, "run_tot_new", "dtype", "bfloat16"), choices=["bfloat16", "float16"])
+    parser.add_argument("--attn-implementation", type=str, default=cfg_get(config, "run_tot_new", "attn_implementation", "flash_attention_2"), choices=["flash_attention_2", "sdpa", "eager"])
     args = parser.parse_args()
 
     print(f"{args.model_path}")
@@ -274,35 +302,37 @@ if __name__ == '__main__':
         if "qwen" in args.model_path or "Qwen" in args.model_path:
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    "/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct",
+                    args.qwen_model_id,
                     torch_dtype=torch.bfloat16,
                     attn_implementation="flash_attention_2",
                     device_map="auto"
                 )
-                processor = AutoProcessor.from_pretrained("/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct")
+                processor = AutoProcessor.from_pretrained(args.qwen_model_id, local_files_only=args.offline)
                 tokenizer = None
                 qwen25_loaded = True
                 print("已本地加载 Qwen2.5-VL-3B-Instruct 并启用 flash attention。")
             except Exception as e:
-                print("Qwen2.5-VL-3B-Instruct 加载失败，尝试加载 Qwen2-VL-7B-Instruct。")
+                print("Qwen 模型加载失败，尝试回退加载配置中的模型。")
                 print(e)
-                os.environ["HF_HOME"] = "/home/Cr_seu0321/.cache/huggingface"
-                os.environ["HUGGINGFACE_HUB_CACHE"] = "/home/Cr_seu0321/.cache/huggingface"
-                os.environ["TRANSFORMERS_CACHE"] = "/home/Cr_seu0321/.cache/huggingface"
-                os.environ["HF_HUB_OFFLINE"] = "1"
-                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                if args.hf_cache_dir:
+                    os.environ["HF_HOME"] = args.hf_cache_dir
+                    os.environ["HUGGINGFACE_HUB_CACHE"] = args.hf_cache_dir
+                    os.environ["TRANSFORMERS_CACHE"] = args.hf_cache_dir
+                if args.offline:
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-                LOCAL_ID = "Qwen/Qwen2-VL-7B-Instruct"
-
+                dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
                 model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    LOCAL_ID,
-                    local_files_only=True,
-                    torch_dtype=torch.bfloat16,
+                    args.qwen_model_id,
+                    local_files_only=args.offline,
+                    torch_dtype=dtype,
+                    attn_implementation=args.attn_implementation,
                     device_map="auto",
-                    )           
+                    )
                 processor = AutoProcessor.from_pretrained(
-                            LOCAL_ID,
-                            local_files_only=True
+                            args.qwen_model_id,
+                            local_files_only=args.offline
                     )
                 tokenizer = None
                 qwen25_loaded = False
