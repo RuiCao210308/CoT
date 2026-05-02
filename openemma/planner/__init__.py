@@ -26,6 +26,13 @@ from .qwen_planner import (
     generate_with_qwen,
     select_planning_hidden,
 )
+from .action_head import (
+    ContinuousActionHead,
+    action_chunk_l1_loss,
+    build_continuous_action_head,
+    denormalize_action_chunk,
+    normalize_action_chunk,
+)
 
 __all__ = [
     "PlannerInput",
@@ -50,4 +57,9 @@ __all__ = [
     "extract_qwen_hidden_states",
     "generate_with_qwen",
     "select_planning_hidden",
+    "ContinuousActionHead",
+    "action_chunk_l1_loss",
+    "build_continuous_action_head",
+    "denormalize_action_chunk",
+    "normalize_action_chunk",
 ]
