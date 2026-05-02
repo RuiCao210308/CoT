@@ -38,6 +38,14 @@ from utils import (
     IntegrateCurvatureForPoints,
     WriteImageSequenceToVideo,
 )
+from openemma.planner import (
+    PlannerInput,
+    build_speed_curvature_prompt,
+    build_speed_curvature_sys_message,
+    format_obs_speed_curvature as planner_format_obs_speed_curvature,
+    parse_speed_curvature_text as planner_parse_speed_curvature_text,
+    standardize_speed_curvature_output,
+)
 
 from PIL import Image
 from transformers import (
@@ -73,31 +81,7 @@ def parse_speed_curvature_text(raw_text, max_len=FUT_LEN):
     raw_text 例如："Future speeds and curvatures: [4.3,-0.5], [4.2,-0.6], ..."
     返回 np.ndarray shape (T, 2)，如果解析失败返回 None。
     """
-    if not isinstance(raw_text, str):
-        return None
-
-    # 干掉前缀
-    raw_text = raw_text.replace("Future speeds and curvatures:", "")
-    coords = re.findall(r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]", raw_text)
-    if not coords:
-        return None
-
-    pairs = []
-    for v, k in coords:
-        try:
-            v_f = float(v)
-            k_f = float(k)
-            pairs.append([v_f, k_f])
-        except Exception:
-            continue
-
-    if not pairs:
-        return None
-
-    arr = np.array(pairs, dtype=np.float32)
-    if arr.shape[0] > max_len:
-        arr = arr[:max_len]
-    return arr
+    return planner_parse_speed_curvature_text(raw_text, max_len=max_len)
 
 def safe_print(msg, use_tqdm):
     if use_tqdm:
@@ -361,29 +345,11 @@ def DescribeOrUpdateIntent(obs_images, prev_intent=None,
 
 
 def build_sys_message():
-    sys_message = (
-        "You are an autonomous driving labeller. You have access to a front-view camera image of a vehicle, "
-        "a sequence of past speeds, a sequence of past curvatures, and a driving rationale. Each speed, curvature "
-        "is represented as [v, k], where v corresponds to the speed, and k corresponds to the curvature. "
-        "A positive k means the vehicle is turning left. A negative k means the vehicle is turning right. "
-        "The larger the absolute value of k, the sharper the turn. A close to zero k means the vehicle is "
-        "driving straight. As a driver on the road, you should follow any common sense traffic rules. "
-        "You should try to stay in the middle of your lane. You should maintain necessary distance from "
-        "the leading vehicle. You should observe lane markings and follow them.  Your task is to do your "
-        "best to predict future speeds and curvatures for the vehicle over the next 10 timesteps given "
-        "vehicle intent inferred from the image. Make a best guess if the problem is too difficult for you. "
-        "If you cannot provide a response people will get injured."
-    )
-    return sys_message
+    return build_speed_curvature_sys_message(article="an")
 
 
 def format_obs_speed_curvature(obs_velocities, obs_curvatures):
-    # 速度模长
-    obs_vel_norm = np.linalg.norm(obs_velocities, axis=1)
-    # 曲率 *100
-    obs_curv_scaled = obs_curvatures * 100.0
-    pairs = [f"[{v:.1f},{k:.1f}]" for v, k in zip(obs_vel_norm, obs_curv_scaled)]
-    return ", ".join(pairs), obs_vel_norm[-1], obs_curv_scaled[-1]
+    return planner_format_obs_speed_curvature(obs_velocities, obs_curvatures)
 
 
 def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
@@ -401,24 +367,22 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
     object_description = DescribeObjects(obs_images, processor, model, tokenizer, args)
     intent_description = DescribeOrUpdateIntent(obs_images, None, processor, model, tokenizer, args)
 
-    obs_speed_curvature_str, _, _ = format_obs_speed_curvature(obs_velocities, obs_curvatures)
-    #print(f"Observed Speed and Curvature: {obs_speed_curvature_str}")
-
     sys_message = build_sys_message()
 
-    if extra_intent_text is None:
-        extra_intent_text = ""
-
-    prompt = f"""
-These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-The scene is described as follows: {scene_description}. 
-The identified critical objects are {object_description}. 
-The car's intent is {intent_description}. {extra_intent_text}
-The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format
-[speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. 
-Write the raw text not markdown or latex. Future speeds and curvatures:
-    """.strip()
+    planner_input = PlannerInput(
+        images=obs_images,
+        obs_velocities=obs_velocities,
+        obs_curvatures=obs_curvatures,
+        scene_description=scene_description,
+        object_description=object_description,
+        intent_description=intent_description,
+        method=args.method,
+        reasoning_mode=getattr(args, "reasoning_mode", "cot"),
+        extra_intent_text=extra_intent_text or "",
+        horizon=FUT_LEN,
+    )
+    prompt, obs_speed_curvature_str = build_speed_curvature_prompt(planner_input)
+    #print(f"Observed Speed and Curvature: {obs_speed_curvature_str}")
 
     raw = None
     for _ in range(3):
@@ -665,9 +629,18 @@ def main_loop(args, model, processor, tokenizer):
                 print(f"   → frame {i}: parse failed, skip.")
                 continue
 
-            # 曲率缩放回真实值
-            pred_curv = pred_vk[:, 1] / 100.0
-            pred_speed = pred_vk[:, 0]
+            planner_output = standardize_speed_curvature_output(
+                speed_curvature=pred_vk,
+                initial_position=fut_traj_world[0],
+                initial_heading=atan2(ego_velocities[i + OBS_LEN - 1][1],
+                                      ego_velocities[i + OBS_LEN - 1][0]),
+                max_len=FUT_LEN,
+                scene_description=scene_desc,
+                object_description=obj_desc,
+                intent_description=intent_desc,
+            )
+            pred_curv = planner_output.curvatures
+            pred_speed = planner_output.speeds
             #print预测
             pred_len = min(FUT_LEN, len(pred_curv))
             pred_pairs_str = ",".join([f"[{v:.2f},{k*100:.2f}]" for v,k in zip(pred_speed[:pred_len], pred_curv[:pred_len])])
@@ -676,15 +649,7 @@ def main_loop(args, model, processor, tokenizer):
             fut_traj_world_np = np.array(fut_traj_world)
 
             # 轨迹积分
-            pred_traj = np.zeros((pred_len, 3), dtype=np.float32)
-            pred_traj[:, :2] = IntegrateCurvatureForPoints(
-                pred_curv[:pred_len],
-                pred_speed[:pred_len],
-                fut_traj_world_np[0],
-                atan2(ego_velocities[i + OBS_LEN - 1][1],
-                      ego_velocities[i + OBS_LEN - 1][0]),
-                pred_len,
-            )
+            pred_traj = planner_output.trajectory
 
             # ADE 指标
             ade_all = np.mean(np.linalg.norm(fut_traj_world_np[:pred_len] - pred_traj[:pred_len], axis=1))

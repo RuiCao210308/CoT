@@ -16,6 +16,13 @@ from scipy.integrate import cumulative_trapezoid
 
 import json
 from openemma.YOLO3D.inference import yolo3d_nuScenes
+from openemma.planner import (
+    PlannerInput,
+    build_speed_curvature_prompt,
+    build_speed_curvature_sys_message,
+    parse_speed_curvature_text,
+    standardize_speed_curvature_output,
+)
 from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
 from transformers import MllamaForConditionalGeneration, AutoProcessor, Qwen2VLForConditionalGeneration, AutoTokenizer
 from PIL import Image
@@ -208,42 +215,22 @@ def GenerateMotion(obs_images, obs_waypoints, obs_velocities, obs_curvatures, gi
         print(f'Object Description: {object_description}')
         print(f'Intent Description: {intent_description}')
 
-    # Convert array waypoints to string.
-    obs_waypoints_str = [f"[{x[0]:.2f},{x[1]:.2f}]" for x in obs_waypoints]
-    obs_waypoints_str = ", ".join(obs_waypoints_str)
-    obs_velocities_norm = np.linalg.norm(obs_velocities, axis=1)
-    obs_curvatures = obs_curvatures * 100
-    obs_speed_curvature_str = [f"[{x[0]:.1f},{x[1]:.1f}]" for x in zip(obs_velocities_norm, obs_curvatures)]
-    obs_speed_curvature_str = ", ".join(obs_speed_curvature_str)
-
-    
+    planner_input = PlannerInput(
+        images=obs_images,
+        obs_velocities=obs_velocities,
+        obs_curvatures=obs_curvatures,
+        obs_waypoints=obs_waypoints,
+        scene_description=scene_description,
+        object_description=object_description,
+        intent_description=intent_description,
+        method=args.method,
+        reasoning_mode=getattr(args, "reasoning_mode", "cot"),
+        horizon=FUT_LEN,
+    )
+    prompt, obs_speed_curvature_str = build_speed_curvature_prompt(planner_input)
     print(f'Observed Speed and Curvature: {obs_speed_curvature_str}')
 
-    sys_message = ("You are a autonomous driving labeller. You have access to a front-view camera image of a vehicle, a sequence of past speeds, a sequence of past curvatures, and a driving rationale. Each speed, curvature is represented as [v, k], where v corresponds to the speed, and k corresponds to the curvature. A positive k means the vehicle is turning left. A negative k means the vehicle is turning right. The larger the absolute value of k, the sharper the turn. A close to zero k means the vehicle is driving straight. As a driver on the road, you should follow any common sense traffic rules. You should try to stay in the middle of your lane. You should maintain necessary distance from the leading vehicle. You should observe lane markings and follow them.  Your task is to do your best to predict future speeds and curvatures for the vehicle over the next 10 timesteps given vehicle intent inferred from the image. Make a best guess if the problem is too difficult for you. If you cannot provide a response people will get injured.\n")
-
-    # [修改] 根据推理模式调整提示词
-    if args.method == "openemma":
-        if hasattr(args, 'reasoning_mode') and args.reasoning_mode != 'cot':
-            # 对于非标准CoT模式，添加推理模式说明
-            prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-            The scene is described as follows: {scene_description}. 
-            The identified critical objects are {object_description}. 
-            The car's intent is {intent_description}. 
-            The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-            Use {args.reasoning_mode} reasoning approach to analyze the scenario and generate the predicted future speeds and curvatures.
-            Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
-        else:
-            # 标准CoT模式
-            prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-            The scene is described as follows: {scene_description}. 
-            The identified critical objects are {object_description}. 
-            The car's intent is {intent_description}. 
-            The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-            Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
-    else:
-        prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-        The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+    sys_message = build_speed_curvature_sys_message(trailing_newline=True)
     for rho in range(3):
         result = vlm_inference(text=prompt, images=obs_images, sys_message=sys_message, processor=processor, model=model, tokenizer=tokenizer, args=args)
         if not "unable" in result and not "sorry" in result and "[" in result:
@@ -442,6 +429,7 @@ if __name__ == '__main__':
                 with open(os.path.join(curr_image), "rb") as image_file:
                     img = cv2.imdecode(np.frombuffer(image_file.read(), dtype=np.uint8), cv2.IMREAD_COLOR)
 
+            speed_curvature_arr = None
             for rho in range(3):
                 # Assemble the prompt.
                 if not "gpt" in args.model_path:
@@ -454,14 +442,12 @@ if __name__ == '__main__':
 
                 # Process the output.
                 prev_intent = updated_intent  # Stateful intent
-                pred_waypoints = prediction.replace("Future speeds and curvatures:", "").strip()
-                coordinates = re.findall(r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]", pred_waypoints)
-                if not coordinates == []:
+                speed_curvature_arr = parse_speed_curvature_text(prediction, max_len=FUT_LEN)
+                if speed_curvature_arr is not None:
                     break
-            if coordinates == []:
+            if speed_curvature_arr is None:
                 continue
-            speed_curvature_pred = [[float(v), float(k)] for v, k in coordinates]
-            speed_curvature_pred = speed_curvature_pred[:10]
+            speed_curvature_pred = speed_curvature_arr.tolist()
             print(f"Got {len(speed_curvature_pred)} future actions: {speed_curvature_pred}")
 
             # GT
@@ -469,14 +455,19 @@ if __name__ == '__main__':
 
             # Pred
             pred_len = min(FUT_LEN, len(speed_curvature_pred))
-            pred_curvatures = np.array(speed_curvature_pred)[:, 1] / 100
-            pred_speeds = np.array(speed_curvature_pred)[:, 0]
-            pred_traj = np.zeros((pred_len, 3))
-            pred_traj[:pred_len, :2] = IntegrateCurvatureForPoints(pred_curvatures,
-                                                                   pred_speeds,
-                                                                   fut_start_world,
-                                                                   atan2(obs_ego_velocities[-1][1],
-                                                                         obs_ego_velocities[-1][0]), pred_len)
+            planner_output = standardize_speed_curvature_output(
+                raw_text=prediction,
+                speed_curvature=speed_curvature_arr,
+                initial_position=fut_start_world,
+                initial_heading=atan2(obs_ego_velocities[-1][1], obs_ego_velocities[-1][0]),
+                max_len=FUT_LEN,
+                scene_description=scene_description,
+                object_description=object_description,
+                intent_description=updated_intent,
+            )
+            pred_curvatures = planner_output.curvatures
+            pred_speeds = planner_output.speeds
+            pred_traj = planner_output.trajectory
 
             # Overlay the trajectory.
             check_flag = OverlayTrajectory(img, pred_traj.tolist(), obs_camera_params[-1], obs_ego_poses[-1], color=(255, 0, 0), args=args)
@@ -606,4 +597,3 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
             )
             return output_text[0]
     # ... 其它模型推理逻辑保持不变 ...
-
