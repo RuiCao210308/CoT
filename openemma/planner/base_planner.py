@@ -53,6 +53,19 @@ def format_obs_speed_curvature(obs_velocities, obs_curvatures, curvature_scale=1
     return ", ".join(pairs), obs_vel_norm[-1], obs_curv_scaled[-1]
 
 
+def format_structured_ego_history(obs_velocities, obs_curvatures, dt=0.5, curvature_scale=100.0):
+    obs_vel_norm = np.linalg.norm(obs_velocities, axis=1)
+    obs_curv_scaled = obs_curvatures * curvature_scale
+    history_len = len(obs_vel_norm)
+    rows = []
+    for idx, (speed, curvature) in enumerate(zip(obs_vel_norm, obs_curv_scaled)):
+        rel_time = (idx - history_len + 1) * dt
+        rows.append(
+            f"history_step_{idx}: t={rel_time:.1f}s, speed_mps={speed:.1f}, curvature_x100={curvature:.1f}"
+        )
+    return "\n".join(rows)
+
+
 def build_speed_curvature_sys_message(trailing_newline=False, article="a"):
     message = (
         f"You are {article} autonomous driving labeller. You have access to a front-view camera image of a vehicle, "
@@ -75,9 +88,21 @@ def build_speed_curvature_prompt(planner_input: PlannerInput):
         planner_input.obs_velocities,
         planner_input.obs_curvatures,
     )
+    ego_history_text = format_structured_ego_history(
+        planner_input.obs_velocities,
+        planner_input.obs_curvatures,
+    )
     method = planner_input.method
     reasoning_mode = planner_input.reasoning_mode
     extra_intent_text = planner_input.extra_intent_text or ""
+    common_output_instruction = (
+        "Predict the next 10 future timesteps after history_step_9. "
+        "Do not copy or repeat the historical ego history. "
+        "The first predicted pair must describe future_step_1, the timestep immediately after history_step_9. "
+        "Output exactly 10 bracket pairs and no markdown: "
+        "[speed_1, curvature_1], [speed_2, curvature_2], ..., [speed_10, curvature_10]. "
+        "Use curvature_x100 units in the output, matching the history scale."
+    )
 
     if method == "openemma":
         if reasoning_mode != "cot":
@@ -85,31 +110,37 @@ def build_speed_curvature_prompt(planner_input: PlannerInput):
             The scene is described as follows: {planner_input.scene_description}. 
             The identified critical objects are {planner_input.object_description}. 
             The car's intent is {planner_input.intent_description}. 
-            The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
+            Historical ego states over the past 5 seconds:
+            {ego_history_text}
             Use {reasoning_mode} reasoning approach to analyze the scenario and generate the predicted future speeds and curvatures.
-            Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+            {common_output_instruction}
+            Future speeds and curvatures:"""
         else:
             prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
             The scene is described as follows: {planner_input.scene_description}. 
             The identified critical objects are {planner_input.object_description}. 
             The car's intent is {planner_input.intent_description}. 
-            The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-            Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+            Historical ego states over the past 5 seconds:
+            {ego_history_text}
+            Infer the association between these ego states and the image sequence. {common_output_instruction}
+            Future speeds and curvatures:"""
     elif method in {"cot", "sc", "tot"}:
         prompt = f"""
 These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
 The scene is described as follows: {planner_input.scene_description}. 
 The identified critical objects are {planner_input.object_description}. 
 The car's intent is {planner_input.intent_description}. {extra_intent_text}
-The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format
-[speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. 
-Write the raw text not markdown or latex. Future speeds and curvatures:
+Historical ego states over the past 5 seconds:
+{ego_history_text}
+Infer the association between these ego states and the image sequence. {common_output_instruction}
+Future speeds and curvatures:
     """.strip()
     else:
         prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-        The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+        Historical ego states over the past 5 seconds:
+        {ego_history_text}
+        Infer the association between these ego states and the image sequence. {common_output_instruction}
+        Future speeds and curvatures:"""
 
     return prompt, obs_speed_curvature_str
 
