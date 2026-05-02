@@ -190,6 +190,10 @@ def check_action_chunk_jsonl(
             "extreme_target_curvature_abs_gt": 0,
             "extreme_prediction_curvature_abs_gt": 0,
         },
+        "curvature_stats_1pm": {
+            "target": [],
+            "prediction": [],
+        },
         "planner_guard": {
             "present": 0,
             "invalid": 0,
@@ -278,6 +282,7 @@ def check_action_chunk_jsonl(
             summary["range_violations"]["extreme_target_curvature_abs_gt"] += _abs_gt_violations(
                 target_arr[:, 1], curvature_extreme_abs_1pm
             )
+            summary["curvature_stats_1pm"]["target"].extend(np.abs(target_arr[:, 1]).tolist())
 
         if pred_arr is not None:
             if pred_arr.shape != (expected_future_len, 2) and len(summary["examples"]) < max_examples:
@@ -297,6 +302,7 @@ def check_action_chunk_jsonl(
             summary["range_violations"]["extreme_prediction_curvature_abs_gt"] += _abs_gt_violations(
                 pred_arr[:, 1], curvature_extreme_abs_1pm
             )
+            summary["curvature_stats_1pm"]["prediction"].extend(np.abs(pred_arr[:, 1]).tolist())
 
         prediction = record.get("prediction", {})
         guard = prediction.get("planner_guard") or {}
@@ -339,6 +345,10 @@ def finalize_action_chunk_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     for key, counter in list(summary["shape_counts"].items()):
         summary["shape_counts"][key] = dict(counter)
     summary["prompt"]["prompt_type_counts"] = dict(summary["prompt"]["prompt_type_counts"])
+    summary["curvature_stats_1pm"] = {
+        key: numeric_stats(values)
+        for key, values in summary["curvature_stats_1pm"].items()
+    }
 
     guard = summary["planner_guard"]
     guard["trigger_rate"] = (guard["invalid"] / records) if records else None
@@ -378,6 +388,7 @@ def format_action_chunk_summary(summary: Dict[str, Any]) -> str:
         f"  validation_errors: {summary['validation_errors']}",
         f"  curvature_units: {summary['curvature_units']}",
         f"  curvature_thresholds_1pm: {summary['curvature_thresholds_1pm']}",
+        f"  curvature_stats_1pm: {summary['curvature_stats_1pm']}",
         f"  shapes.ego_history_array: {summary['shape_counts']['ego_history_array']}",
         f"  shapes.future_action_gt: {summary['shape_counts']['future_action_gt']}",
         f"  shapes.qwen_predicted_action: {summary['shape_counts']['qwen_predicted_action']}",

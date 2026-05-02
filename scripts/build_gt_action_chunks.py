@@ -24,7 +24,6 @@ from base_planner import (
     build_speed_curvature_sys_message,
     encode_ego_state_array,
 )
-from utils import EstimateCurvatureFromTrajectory
 
 
 def parse_args():
@@ -38,6 +37,9 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=0, help="0 means no limit.")
     parser.add_argument("--method", type=str, default="gt")
     parser.add_argument("--model_path", type=str, default="qwen")
+    parser.add_argument("--max_abs_curvature_1pm", type=float, default=0.2)
+    parser.add_argument("--min_segment_distance", type=float, default=0.2)
+    parser.add_argument("--skip_if_extreme_curvature", type=lambda x: str(x).lower() == "true", default=False)
     return parser.parse_args()
 
 
@@ -84,14 +86,82 @@ def collect_scene_samples(nusc: NuScenes, scene: Dict[str, Any], camera: str):
     return sample_tokens, sample_timestamps, image_paths, ego_poses
 
 
-def estimate_scene_motion(ego_poses: List[Dict[str, Any]]):
-    ego_poses_world = np.asarray([pose["translation"][:3] for pose in ego_poses], dtype=np.float32)
-    ego_velocities = np.zeros_like(ego_poses_world)
-    ego_velocities[1:] = ego_poses_world[1:] - ego_poses_world[:-1]
-    if len(ego_velocities) > 1:
-        ego_velocities[0] = ego_velocities[1]
-    ego_curvatures = EstimateCurvatureFromTrajectory(ego_poses_world).astype(np.float32)
-    return ego_poses_world, ego_velocities, ego_curvatures
+def timestamps_to_seconds(timestamps: List[Optional[int]]) -> np.ndarray:
+    values = np.asarray([0 if ts is None else ts for ts in timestamps], dtype=np.float64)
+    if len(values) == 0:
+        return values
+    if np.nanmax(np.abs(values)) > 1e6:
+        values = values * 1e-6
+    return values
+
+
+def stable_estimate_speed_curvature(
+    points: np.ndarray,
+    timestamps: List[Optional[int]],
+    min_segment_distance: float = 0.2,
+    max_abs_curvature_1pm: float = 0.2,
+):
+    """Estimate stable per-sample speed and curvature from ordered ego positions."""
+    points = np.asarray(points, dtype=np.float64)
+    n = len(points)
+    velocities = np.zeros((n, 3), dtype=np.float32)
+    curvatures = np.zeros(n, dtype=np.float32)
+    clipped_mask = np.zeros(n, dtype=bool)
+    stats = Counter()
+    if n < 2:
+        return velocities, curvatures, clipped_mask, stats
+
+    xy = points[:, :2]
+    deltas = xy[1:] - xy[:-1]
+    ds = np.linalg.norm(deltas, axis=1)
+    seconds = timestamps_to_seconds(timestamps)
+    dt = np.diff(seconds)
+    if len(dt) != len(ds) or not np.isfinite(dt).all():
+        dt = np.full_like(ds, 0.5, dtype=np.float64)
+
+    small_segment = ds < min_segment_distance
+    bad_dt = dt <= 0
+    stats["small_segment_count"] += int(np.count_nonzero(small_segment))
+    stats["bad_dt_count"] += int(np.count_nonzero(bad_dt))
+
+    valid_speed = (~bad_dt) & np.isfinite(ds) & np.isfinite(dt)
+    speed_seg = np.zeros_like(ds, dtype=np.float64)
+    speed_seg[valid_speed] = ds[valid_speed] / dt[valid_speed]
+    segment_vel = np.zeros((len(ds), 3), dtype=np.float64)
+    segment_vel[valid_speed, :2] = deltas[valid_speed] / dt[valid_speed, None]
+    velocities[1:] = segment_vel.astype(np.float32)
+    velocities[0] = velocities[1]
+
+    valid_heading = (~small_segment) & np.isfinite(deltas).all(axis=1)
+    headings = np.zeros(len(ds), dtype=np.float64)
+    headings[valid_heading] = np.arctan2(deltas[valid_heading, 1], deltas[valid_heading, 0])
+    headings = np.unwrap(headings)
+
+    raw_curvatures = np.zeros(n, dtype=np.float64)
+    for idx in range(1, n - 1):
+        prev_seg = idx - 1
+        next_seg = idx
+        if small_segment[prev_seg] or small_segment[next_seg] or bad_dt[prev_seg] or bad_dt[next_seg]:
+            raw_curvatures[idx] = 0.0
+            continue
+        arc_length = 0.5 * (ds[prev_seg] + ds[next_seg])
+        if arc_length <= 1e-6 or not np.isfinite(arc_length):
+            raw_curvatures[idx] = 0.0
+            continue
+        raw_curvatures[idx] = (headings[next_seg] - headings[prev_seg]) / arc_length
+
+    if n > 2:
+        raw_curvatures[0] = raw_curvatures[1]
+        raw_curvatures[-1] = raw_curvatures[-2]
+
+    nonfinite = ~np.isfinite(raw_curvatures)
+    stats["nonfinite_curvature_count"] += int(np.count_nonzero(nonfinite))
+    raw_curvatures[nonfinite] = 0.0
+
+    clipped_mask = np.abs(raw_curvatures) > max_abs_curvature_1pm
+    stats["curvature_clipped_count"] += int(np.count_nonzero(clipped_mask))
+    curvatures = np.clip(raw_curvatures, -max_abs_curvature_1pm, max_abs_curvature_1pm).astype(np.float32)
+    return velocities, curvatures, clipped_mask, stats
 
 
 def build_gt_record(
@@ -106,6 +176,7 @@ def build_gt_record(
     obs_curvatures: np.ndarray,
     future_velocities: np.ndarray,
     future_curvatures: np.ndarray,
+    curvature_clipped: bool = False,
 ):
     system_message = build_speed_curvature_sys_message(article="an")
     planner_input = PlannerInput(
@@ -137,6 +208,9 @@ def build_gt_record(
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "image_path": image_path,
             "camera": args.camera,
+            "curvature_clipped": bool(curvature_clipped),
+            "max_abs_curvature_1pm": args.max_abs_curvature_1pm,
+            "min_segment_distance": args.min_segment_distance,
         },
         "input": {
             "ego_history_array": encode_ego_state_array(obs_velocities, obs_curvatures),
@@ -194,6 +268,7 @@ def build_gt_action_chunks(args):
 
     nusc = NuScenes(version=args.version, dataroot=args.dataroot)
     skipped = Counter()
+    motion_stats = Counter()
     total_candidates = 0
     written = 0
 
@@ -214,7 +289,14 @@ def build_gt_action_chunks(args):
             skipped["scene_too_short"] += 1
             continue
 
-        _, ego_velocities, ego_curvatures = estimate_scene_motion(ego_poses)
+        ego_points = np.asarray([pose["translation"][:3] for pose in ego_poses], dtype=np.float32)
+        ego_velocities, ego_curvatures, clipped_mask, scene_motion_stats = stable_estimate_speed_curvature(
+            ego_points,
+            sample_timestamps,
+            min_segment_distance=args.min_segment_distance,
+            max_abs_curvature_1pm=args.max_abs_curvature_1pm,
+        )
+        motion_stats.update(scene_motion_stats)
         first_current_idx = args.history_steps - 1
         last_current_idx = scene_len - args.future_steps - 1
 
@@ -225,6 +307,10 @@ def build_gt_action_chunks(args):
 
             hist_slice = slice(current_idx - args.history_steps + 1, current_idx + 1)
             fut_slice = slice(current_idx + 1, current_idx + 1 + args.future_steps)
+            future_clipped = bool(np.any(clipped_mask[fut_slice]))
+            if args.skip_if_extreme_curvature and future_clipped:
+                skipped["skipped_by_extreme_curvature"] += 1
+                continue
             record = build_gt_record(
                 args=args,
                 scene=scene,
@@ -237,6 +323,7 @@ def build_gt_action_chunks(args):
                 obs_curvatures=ego_curvatures[hist_slice],
                 future_velocities=ego_velocities[fut_slice],
                 future_curvatures=ego_curvatures[fut_slice],
+                curvature_clipped=future_clipped,
             )
             is_valid, reason = validate_record(record, args.history_steps, args.future_steps)
             if not is_valid:
@@ -251,6 +338,7 @@ def build_gt_action_chunks(args):
     print(f"total scenes: {len(nusc.scene)}")
     print(f"total candidate samples: {total_candidates}")
     print(f"written records: {written}")
+    print(f"motion stats: {dict(motion_stats)}")
     print(f"skipped count by reason: {dict(skipped)}")
     print(f"output path: {args.output_jsonl}")
 
