@@ -95,6 +95,9 @@ def make_action_chunk_record(
     timestamp=None,
     retry_used=False,
     retry_reason=None,
+    system_message=None,
+    planning_prompt=None,
+    prompt_type="speed_curvature_planning",
     extra_metadata=None,
 ):
     """Build one JSON-ready record with ego history [T,3] and action chunks [10,2]."""
@@ -113,6 +116,9 @@ def make_action_chunk_record(
         "input": {
             "ego_history_array": encode_ego_state_array(obs_velocities, obs_curvatures),
             "ego_history_schema": ["relative_time", "speed_mps", "curvature_x100"],
+            "system_message": system_message,
+            "planning_prompt": planning_prompt,
+            "prompt_type": prompt_type,
         },
         "target": {
             "future_action_gt": future_speed_curvature_gt,
@@ -120,7 +126,9 @@ def make_action_chunk_record(
         },
         "prediction": {
             "qwen_predicted_action": predicted_speed_curvature,
+            "qwen_predicted_action_schema": ["speed_mps", "curvature_1pm"],
             "raw_qwen_text": raw_qwen_text,
+            "raw_qwen_text_schema": ["speed_mps", "curvature_x100"],
             "retry_used": bool(retry_used),
             "retry_reason": retry_reason,
             "planner_guard": {

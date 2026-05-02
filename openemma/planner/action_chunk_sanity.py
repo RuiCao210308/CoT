@@ -148,6 +148,11 @@ def check_action_chunk_jsonl(
         "records": 0,
         "json_errors": 0,
         "validation_errors": 0,
+        "curvature_units": {
+            "target.future_action_gt": "curvature_1pm",
+            "prediction.qwen_predicted_action": "curvature_1pm",
+            "prediction.raw_qwen_text": "curvature_x100",
+        },
         "shape_counts": {
             "ego_history_array": Counter(),
             "future_action_gt": Counter(),
@@ -157,6 +162,11 @@ def check_action_chunk_jsonl(
             "ego_history_array": 0,
             "future_action_gt": 0,
             "qwen_predicted_action": 0,
+        },
+        "prompt": {
+            "present": 0,
+            "missing": 0,
+            "prompt_type_counts": Counter(),
         },
         "range_violations": {
             "target_speed": 0,
@@ -211,8 +221,18 @@ def check_action_chunk_jsonl(
                 )
 
         ego = record.get("input", {}).get("ego_history_array")
+        input_section = record.get("input", {})
         target = record.get("target", {}).get("future_action_gt")
         pred = record.get("prediction", {}).get("qwen_predicted_action")
+
+        planning_prompt = input_section.get("planning_prompt")
+        system_message = input_section.get("system_message")
+        if isinstance(planning_prompt, str) and planning_prompt.strip() and isinstance(system_message, str) and system_message.strip():
+            summary["prompt"]["present"] += 1
+        else:
+            summary["prompt"]["missing"] += 1
+        prompt_type = input_section.get("prompt_type") or "missing"
+        summary["prompt"]["prompt_type_counts"][str(prompt_type)] += 1
 
         summary["shape_counts"]["ego_history_array"][_shape_key(_shape_of(ego))] += 1
         summary["shape_counts"]["future_action_gt"][_shape_key(_shape_of(target))] += 1
@@ -304,6 +324,7 @@ def finalize_action_chunk_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     records = summary["records"]
     for key, counter in list(summary["shape_counts"].items()):
         summary["shape_counts"][key] = dict(counter)
+    summary["prompt"]["prompt_type_counts"] = dict(summary["prompt"]["prompt_type_counts"])
 
     guard = summary["planner_guard"]
     guard["trigger_rate"] = (guard["invalid"] / records) if records else None
@@ -341,9 +362,12 @@ def format_action_chunk_summary(summary: Dict[str, Any]) -> str:
         f"  records: {summary['records']}",
         f"  json_errors: {summary['json_errors']}",
         f"  validation_errors: {summary['validation_errors']}",
+        f"  curvature_units: {summary['curvature_units']}",
         f"  shapes.ego_history_array: {summary['shape_counts']['ego_history_array']}",
         f"  shapes.future_action_gt: {summary['shape_counts']['future_action_gt']}",
         f"  shapes.qwen_predicted_action: {summary['shape_counts']['qwen_predicted_action']}",
+        f"  prompt: present={summary['prompt']['present']}, missing={summary['prompt']['missing']}, "
+        f"prompt_type_counts={summary['prompt']['prompt_type_counts']}",
         f"  nonfinite: {summary['nonfinite']}",
         f"  range_violations: {summary['range_violations']}",
         (

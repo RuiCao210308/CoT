@@ -420,6 +420,7 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
     retry_used = False
     retry_reason = None
     retry_count = 0
+    final_planning_prompt = prompt
     max_planner_retries = 3
     for _ in range(max_planner_retries):
         raw = vlm_inference(
@@ -476,6 +477,7 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
             if isinstance(retry_raw, str) and "[" in retry_raw:
                 raw = retry_raw
                 guard_details = retry_guard_details
+                final_planning_prompt = retry_prompt
             if retry_valid:
                 break
     if guard_details is None:
@@ -503,6 +505,9 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
         "retry_used": retry_used,
         "retry_reason": retry_reason,
         "planner_guard": guard_details,
+        "system_message": sys_message,
+        "planning_prompt": final_planning_prompt,
+        "prompt_type": "speed_curvature_planning",
     }
     if return_metadata:
         return raw, scene_description, object_description, intent_description, metadata
@@ -838,6 +843,9 @@ def main_loop(args, model, processor, tokenizer):
                         raw_qwen_text=(pred_meta or {}).get("raw_qwen_text"),
                         retry_used=(pred_meta or {}).get("retry_used", False),
                         retry_reason=(pred_meta or {}).get("retry_reason"),
+                        system_message=(pred_meta or {}).get("system_message"),
+                        planning_prompt=(pred_meta or {}).get("planning_prompt"),
+                        prompt_type=(pred_meta or {}).get("prompt_type", "speed_curvature_planning"),
                         planner_guard=(pred_meta or {}).get("planner_guard"),
                         metrics={
                             "ade": ade_all,
@@ -886,10 +894,11 @@ def main_loop(args, model, processor, tokenizer):
                     f.write(pred_pairs_str+"\n\n")
 
                     last_obs_v = np.linalg.norm(obs_vel[-1])
-                    last_obs_k = obs_curv[-1]*100
+                    last_obs_k_x100 = obs_curv[-1] * 100
+                    pred_k_x100 = pred_curv[0] * 100
                     f.write("First-step difference:\n")
                     f.write(f"delta v = {abs(pred_speed[0] - last_obs_v):.3f}\n")
-                    f.write(f"delta k = {abs(pred_curv[0] - last_obs_k):.3f}\n\n")
+                    f.write(f"delta k_x100 = {abs(pred_k_x100 - last_obs_k_x100):.3f}\n\n")
 
                     f.write(f"ADE_all: {ade_all}\n")
                     f.write(f"ADE1s: {ade1}\n")
