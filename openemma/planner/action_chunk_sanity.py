@@ -8,8 +8,8 @@ import numpy as np
 
 
 DEFAULT_SPEED_RANGE = (-0.5, 45.0)
-DEFAULT_CURVATURE_RANGE_1PM = (-1.0, 1.0)
-EXTREME_CURVATURE_ABS_1PM = 5.0
+DEFAULT_CURVATURE_WARN_ABS_1PM = 0.2
+EXTREME_CURVATURE_ABS_1PM = 0.5
 
 
 def _empty_stats() -> Dict[str, Any]:
@@ -88,6 +88,15 @@ def _range_violations(arr: Optional[np.ndarray], low: float, high: float) -> int
     return int(np.count_nonzero((finite < low) | (finite > high)))
 
 
+def _abs_gt_violations(arr: Optional[np.ndarray], threshold: float) -> int:
+    if arr is None:
+        return 0
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0
+    return int(np.count_nonzero(np.abs(finite) > threshold))
+
+
 def _shape_key(shape: Tuple[int, ...]) -> str:
     if not shape:
         return "invalid"
@@ -139,7 +148,8 @@ def check_action_chunk_jsonl(
     jsonl_path: str,
     expected_future_len: int = 10,
     speed_range: Tuple[float, float] = DEFAULT_SPEED_RANGE,
-    curvature_range_1pm: Tuple[float, float] = DEFAULT_CURVATURE_RANGE_1PM,
+    curvature_warn_abs_1pm: float = DEFAULT_CURVATURE_WARN_ABS_1PM,
+    curvature_extreme_abs_1pm: float = EXTREME_CURVATURE_ABS_1PM,
     max_examples: int = 20,
 ) -> Dict[str, Any]:
     """Read action chunk JSONL and summarize training-readiness issues."""
@@ -152,6 +162,10 @@ def check_action_chunk_jsonl(
             "target.future_action_gt": "curvature_1pm",
             "prediction.qwen_predicted_action": "curvature_1pm",
             "prediction.raw_qwen_text": "curvature_x100",
+        },
+        "curvature_thresholds_1pm": {
+            "warning_abs_gt": curvature_warn_abs_1pm,
+            "extreme_abs_gt": curvature_extreme_abs_1pm,
         },
         "shape_counts": {
             "ego_history_array": Counter(),
@@ -170,11 +184,11 @@ def check_action_chunk_jsonl(
         },
         "range_violations": {
             "target_speed": 0,
-            "target_curvature_1pm": 0,
+            "target_curvature_abs_gt_warn": 0,
             "prediction_speed": 0,
-            "prediction_curvature_1pm": 0,
-            "extreme_target_curvature_abs_gt_5": 0,
-            "extreme_prediction_curvature_abs_gt_5": 0,
+            "prediction_curvature_abs_gt_warn": 0,
+            "extreme_target_curvature_abs_gt": 0,
+            "extreme_prediction_curvature_abs_gt": 0,
         },
         "planner_guard": {
             "present": 0,
@@ -258,11 +272,11 @@ def check_action_chunk_jsonl(
             summary["range_violations"]["target_speed"] += _range_violations(
                 target_arr[:, 0], speed_range[0], speed_range[1]
             )
-            summary["range_violations"]["target_curvature_1pm"] += _range_violations(
-                target_arr[:, 1], curvature_range_1pm[0], curvature_range_1pm[1]
+            summary["range_violations"]["target_curvature_abs_gt_warn"] += _abs_gt_violations(
+                target_arr[:, 1], curvature_warn_abs_1pm
             )
-            summary["range_violations"]["extreme_target_curvature_abs_gt_5"] += int(
-                np.count_nonzero(np.abs(target_arr[np.isfinite(target_arr[:, 1]), 1]) > EXTREME_CURVATURE_ABS_1PM)
+            summary["range_violations"]["extreme_target_curvature_abs_gt"] += _abs_gt_violations(
+                target_arr[:, 1], curvature_extreme_abs_1pm
             )
 
         if pred_arr is not None:
@@ -277,11 +291,11 @@ def check_action_chunk_jsonl(
             summary["range_violations"]["prediction_speed"] += _range_violations(
                 pred_arr[:, 0], speed_range[0], speed_range[1]
             )
-            summary["range_violations"]["prediction_curvature_1pm"] += _range_violations(
-                pred_arr[:, 1], curvature_range_1pm[0], curvature_range_1pm[1]
+            summary["range_violations"]["prediction_curvature_abs_gt_warn"] += _abs_gt_violations(
+                pred_arr[:, 1], curvature_warn_abs_1pm
             )
-            summary["range_violations"]["extreme_prediction_curvature_abs_gt_5"] += int(
-                np.count_nonzero(np.abs(pred_arr[np.isfinite(pred_arr[:, 1]), 1]) > EXTREME_CURVATURE_ABS_1PM)
+            summary["range_violations"]["extreme_prediction_curvature_abs_gt"] += _abs_gt_violations(
+                pred_arr[:, 1], curvature_extreme_abs_1pm
             )
 
         prediction = record.get("prediction", {})
@@ -363,6 +377,7 @@ def format_action_chunk_summary(summary: Dict[str, Any]) -> str:
         f"  json_errors: {summary['json_errors']}",
         f"  validation_errors: {summary['validation_errors']}",
         f"  curvature_units: {summary['curvature_units']}",
+        f"  curvature_thresholds_1pm: {summary['curvature_thresholds_1pm']}",
         f"  shapes.ego_history_array: {summary['shape_counts']['ego_history_array']}",
         f"  shapes.future_action_gt: {summary['shape_counts']['future_action_gt']}",
         f"  shapes.qwen_predicted_action: {summary['shape_counts']['qwen_predicted_action']}",
@@ -425,7 +440,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected_future_len", type=int, default=10, help="Expected future chunk length.")
     parser.add_argument("--min_speed_mps", type=float, default=DEFAULT_SPEED_RANGE[0])
     parser.add_argument("--max_speed_mps", type=float, default=DEFAULT_SPEED_RANGE[1])
-    parser.add_argument("--max_abs_curvature_1pm", type=float, default=DEFAULT_CURVATURE_RANGE_1PM[1])
+    parser.add_argument(
+        "--max_abs_curvature_1pm",
+        type=float,
+        default=DEFAULT_CURVATURE_WARN_ABS_1PM,
+        help="Warning threshold for abs(curvature_1pm). Defaults to 0.2.",
+    )
+    parser.add_argument(
+        "--extreme_abs_curvature_1pm",
+        type=float,
+        default=EXTREME_CURVATURE_ABS_1PM,
+        help="Extreme threshold for abs(curvature_1pm). Defaults to 0.5.",
+    )
     parser.add_argument("--max_examples", type=int, default=20)
     return parser
 
@@ -438,7 +464,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.jsonl_path,
         expected_future_len=args.expected_future_len,
         speed_range=(args.min_speed_mps, args.max_speed_mps),
-        curvature_range_1pm=(-max_abs_curv, max_abs_curv),
+        curvature_warn_abs_1pm=max_abs_curv,
+        curvature_extreme_abs_1pm=abs(float(args.extreme_abs_curvature_1pm)),
         max_examples=args.max_examples,
     )
     print(format_action_chunk_summary(summary))
