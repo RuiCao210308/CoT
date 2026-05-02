@@ -19,7 +19,9 @@ from openemma.YOLO3D.inference import yolo3d_nuScenes
 from openemma.planner import (
     PlannerInput,
     build_speed_curvature_prompt,
+    build_speed_curvature_retry_prompt,
     build_speed_curvature_sys_message,
+    evaluate_speed_curvature_prediction,
     parse_speed_curvature_text,
     standardize_speed_curvature_output,
 )
@@ -233,8 +235,29 @@ def GenerateMotion(obs_images, obs_waypoints, obs_velocities, obs_curvatures, gi
     sys_message = build_speed_curvature_sys_message(trailing_newline=True)
     for rho in range(3):
         result = vlm_inference(text=prompt, images=obs_images, sys_message=sys_message, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        if not "unable" in result and not "sorry" in result and "[" in result:
+        parsed_result = parse_speed_curvature_text(result, max_len=FUT_LEN)
+        is_valid, reject_reasons = evaluate_speed_curvature_prediction(
+            parsed_result,
+            obs_velocities,
+            obs_curvatures,
+        )
+        has_prediction = isinstance(result, str) and not "unable" in result and not "sorry" in result and "[" in result
+        if has_prediction and is_valid:
             break
+        if has_prediction:
+            print(f"[PlannerGuard] retrying rejected prediction: {', '.join(reject_reasons)}")
+            retry_prompt = build_speed_curvature_retry_prompt(prompt, result, reject_reasons)
+            retry_result = vlm_inference(text=retry_prompt, images=obs_images, sys_message=sys_message, processor=processor, model=model, tokenizer=tokenizer, args=args)
+            retry_parsed = parse_speed_curvature_text(retry_result, max_len=FUT_LEN)
+            retry_valid, _ = evaluate_speed_curvature_prediction(
+                retry_parsed,
+                obs_velocities,
+                obs_curvatures,
+            )
+            if isinstance(retry_result, str) and "[" in retry_result:
+                result = retry_result
+            if retry_valid:
+                break
     return result, scene_description, object_description, intent_description
 
 if __name__ == '__main__':

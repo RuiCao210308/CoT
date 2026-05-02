@@ -66,6 +66,22 @@ def format_structured_ego_history(obs_velocities, obs_curvatures, dt=0.5, curvat
     return "\n".join(rows)
 
 
+def encode_ego_state_array(obs_velocities, obs_curvatures, dt=0.5, curvature_scale=100.0):
+    """Return a structured numeric ego history for future projectors or action heads."""
+    obs_vel_norm = np.linalg.norm(obs_velocities, axis=1)
+    obs_curv_scaled = obs_curvatures * curvature_scale
+    history_len = len(obs_vel_norm)
+    rel_times = np.array([(idx - history_len + 1) * dt for idx in range(history_len)], dtype=np.float32)
+    return np.stack(
+        [
+            rel_times,
+            obs_vel_norm.astype(np.float32),
+            obs_curv_scaled.astype(np.float32),
+        ],
+        axis=1,
+    )
+
+
 def build_speed_curvature_sys_message(trailing_newline=False, article="a"):
     message = (
         f"You are {article} autonomous driving labeller. You have access to a front-view camera image of a vehicle, "
@@ -143,6 +159,76 @@ Future speeds and curvatures:
         Future speeds and curvatures:"""
 
     return prompt, obs_speed_curvature_str
+
+
+def evaluate_speed_curvature_prediction(speed_curvature, obs_velocities, obs_curvatures, curvature_scale=100.0, return_details=False):
+    def _finish(reasons, repeated_pair_ratio=None, history_overlap_ratio=None, flat_repeat_detected=False):
+        details = {
+            "is_valid": len(reasons) == 0,
+            "reasons": reasons,
+            "repeated_pair_ratio": repeated_pair_ratio,
+            "history_overlap_ratio": history_overlap_ratio,
+            "flat_repeat_detected": flat_repeat_detected,
+        }
+        if return_details:
+            return details
+        return details["is_valid"], details["reasons"]
+
+    if speed_curvature is None:
+        return _finish(["parse_failed"])
+
+    pred = np.asarray(speed_curvature, dtype=np.float32)
+    if pred.ndim != 2 or pred.shape[0] == 0 or pred.shape[1] < 2:
+        return _finish(["invalid_shape"])
+
+    obs_speed = np.linalg.norm(obs_velocities, axis=1).astype(np.float32)
+    obs_curv = (obs_curvatures * curvature_scale).astype(np.float32)
+    obs = np.stack([obs_speed, obs_curv], axis=1)
+
+    reasons = []
+    moving = float(obs_speed[-1]) > 0.5
+    pred_speed_std = float(np.std(pred[:, 0]))
+    pred_curv_std = float(np.std(pred[:, 1]))
+    flat_repeat_detected = moving and pred.shape[0] >= 4 and pred_speed_std < 0.05 and pred_curv_std < 0.05
+    if flat_repeat_detected:
+        reasons.append("flat_repeated_pair")
+
+    unique_pairs = np.unique(np.round(pred[:, :2], decimals=2), axis=0)
+    repeated_pair_ratio = 1.0 - (len(unique_pairs) / len(pred))
+
+    compare_len = min(len(pred), len(obs))
+    if compare_len >= 4:
+        if np.allclose(pred[:compare_len], obs[:compare_len], atol=[0.06, 0.06]):
+            reasons.append("copied_history_prefix")
+        if np.allclose(pred[:compare_len], obs[-compare_len:], atol=[0.06, 0.06]):
+            reasons.append("copied_history_suffix")
+
+    matched_history = 0
+    for pair in pred:
+        if np.any(np.all(np.isclose(obs, pair, atol=[0.06, 0.06]), axis=1)):
+            matched_history += 1
+    history_overlap_ratio = matched_history / len(pred)
+    if len(pred) >= 6 and history_overlap_ratio >= 0.8:
+        reasons.append("mostly_reused_history_pairs")
+
+    return _finish(
+        reasons,
+        repeated_pair_ratio=float(repeated_pair_ratio),
+        history_overlap_ratio=float(history_overlap_ratio),
+        flat_repeat_detected=bool(flat_repeat_detected),
+    )
+
+
+def build_speed_curvature_retry_prompt(base_prompt, raw_text, reasons):
+    reason_text = ", ".join(reasons) if reasons else "invalid_or_copied_prediction"
+    return f"""{base_prompt}
+
+The previous answer was rejected because it looked like {reason_text}.
+Rejected answer:
+{raw_text}
+
+Revise the answer. Start from the current motion state, but do not repeat history_step_9 across the horizon and do not copy historical pairs. Use the image, scene, objects, and intent to infer how speed and curvature should evolve after the observed window.
+Future speeds and curvatures:"""
 
 
 def parse_speed_curvature_text(raw_text, max_len=10):

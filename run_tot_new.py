@@ -41,10 +41,16 @@ from utils import (
 from openemma.planner import (
     PlannerInput,
     build_speed_curvature_prompt,
+    build_speed_curvature_retry_prompt,
     build_speed_curvature_sys_message,
+    evaluate_speed_curvature_prediction,
     format_obs_speed_curvature as planner_format_obs_speed_curvature,
     parse_speed_curvature_text as planner_parse_speed_curvature_text,
     standardize_speed_curvature_output,
+)
+from openemma.planner.action_chunk_dataset import (
+    append_action_chunk_jsonl,
+    make_action_chunk_record,
 )
 
 from PIL import Image
@@ -355,7 +361,8 @@ def format_obs_speed_curvature(obs_velocities, obs_curvatures):
 def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
                            processor=None, model=None, tokenizer=None, args=None,
                            extra_intent_text=None,
-                           temperature=1.0, top_p=0.9):
+                           temperature=1.0, top_p=0.9,
+                           return_metadata=False):
     """
     单次 CoT 预测，用于：
       - baseline CoT
@@ -385,6 +392,9 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
     #print(f"Observed Speed and Curvature: {obs_speed_curvature_str}")
 
     raw = None
+    guard_details = None
+    retry_used = False
+    retry_reason = None
     for _ in range(3):
         raw = vlm_inference(
             text=prompt,
@@ -398,8 +408,55 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
             top_p=top_p,
             max_new_tokens=256,
         )
-        if isinstance(raw, str) and "[" in raw:
+        arr = parse_speed_curvature_text(raw)
+        guard_details = evaluate_speed_curvature_prediction(
+            arr,
+            obs_velocities,
+            obs_curvatures,
+            return_details=True,
+        )
+        is_valid = guard_details["is_valid"]
+        reject_reasons = guard_details["reasons"]
+        if isinstance(raw, str) and "[" in raw and is_valid:
             break
+        if isinstance(raw, str) and "[" in raw:
+            print(f"[PlannerGuard] retrying rejected prediction: {', '.join(reject_reasons)}")
+            retry_used = True
+            retry_reason = ", ".join(reject_reasons)
+            retry_prompt = build_speed_curvature_retry_prompt(prompt, raw, reject_reasons)
+            retry_raw = vlm_inference(
+                text=retry_prompt,
+                images=obs_images,
+                sys_message=sys_message,
+                processor=processor,
+                model=model,
+                tokenizer=tokenizer,
+                args=args,
+                temperature=max(temperature, 0.8),
+                top_p=top_p,
+                max_new_tokens=256,
+            )
+            retry_arr = parse_speed_curvature_text(retry_raw)
+            retry_guard_details = evaluate_speed_curvature_prediction(
+                retry_arr,
+                obs_velocities,
+                obs_curvatures,
+                return_details=True,
+            )
+            retry_valid = retry_guard_details["is_valid"]
+            if isinstance(retry_raw, str) and "[" in retry_raw:
+                raw = retry_raw
+                guard_details = retry_guard_details
+            if retry_valid:
+                break
+    metadata = {
+        "raw_qwen_text": raw,
+        "retry_used": retry_used,
+        "retry_reason": retry_reason,
+        "planner_guard": guard_details,
+    }
+    if return_metadata:
+        return raw, scene_description, object_description, intent_description, metadata
     return raw, scene_description, object_description, intent_description
 
 
@@ -408,13 +465,14 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
 # ------------------------------------------------
 def predict_with_cot(obs_images, obs_velocities, obs_curvatures,
                      processor, model, tokenizer, args):
-    raw, scene_desc, obj_desc, intent_desc = generate_motion_single(
+    raw, scene_desc, obj_desc, intent_desc, pred_meta = generate_motion_single(
         obs_images, obs_velocities, obs_curvatures,
         processor=processor, model=model, tokenizer=tokenizer, args=args,
-        temperature=0.7, top_p=0.9
+        temperature=0.7, top_p=0.9,
+        return_metadata=True,
     )
     arr = parse_speed_curvature_text(raw)
-    return arr, scene_desc, obj_desc, intent_desc
+    return arr, scene_desc, obj_desc, intent_desc, pred_meta
 
 
 def predict_with_sc(obs_images, obs_velocities, obs_curvatures,
@@ -422,24 +480,31 @@ def predict_with_sc(obs_images, obs_velocities, obs_curvatures,
                     sc_samples=5):
     preds = []
     first_scene = first_obj = first_intent = None
+    first_meta = None
 
     for i in range(sc_samples):
-        raw, scene_desc, obj_desc, intent_desc = generate_motion_single(
+        raw, scene_desc, obj_desc, intent_desc, pred_meta = generate_motion_single(
             obs_images, obs_velocities, obs_curvatures,
             processor=processor, model=model, tokenizer=tokenizer, args=args,
-            temperature=1.0, top_p=0.9
+            temperature=1.0, top_p=0.9,
+            return_metadata=True,
         )
         arr = parse_speed_curvature_text(raw)
         if arr is not None:
             preds.append(arr)
             if first_scene is None:
                 first_scene, first_obj, first_intent = scene_desc, obj_desc, intent_desc
+                first_meta = pred_meta
 
     if not preds:
-        return None, None, None, None
+        return None, None, None, None, None
 
     mean_pred = average_predictions(preds)
-    return mean_pred, first_scene, first_obj, first_intent
+    if first_meta is not None:
+        first_meta = dict(first_meta)
+        first_meta["raw_qwen_text"] = first_meta.get("raw_qwen_text")
+        first_meta["sc_samples"] = len(preds)
+    return mean_pred, first_scene, first_obj, first_intent, first_meta
 
 
 def predict_with_tot(obs_images, obs_velocities, obs_curvatures,
@@ -457,14 +522,16 @@ def predict_with_tot(obs_images, obs_velocities, obs_curvatures,
     best_score = -1e9
     best_pred = None
     best_scene = best_obj = best_intent = None
+    best_meta = None
 
     for intent_hint in TOT_CANDIDATE_INTENTS:
         extra_text = f"Assume the driver intent is: {intent_hint}."
-        raw, scene_desc, obj_desc, intent_desc = generate_motion_single(
+        raw, scene_desc, obj_desc, intent_desc, pred_meta = generate_motion_single(
             obs_images, obs_velocities, obs_curvatures,
             processor=processor, model=model, tokenizer=tokenizer, args=args,
             extra_intent_text=extra_text,
-            temperature=0.9, top_p=0.9
+            temperature=0.9, top_p=0.9,
+            return_metadata=True,
         )
         arr = parse_speed_curvature_text(raw)
         if arr is None:
@@ -475,10 +542,13 @@ def predict_with_tot(obs_images, obs_velocities, obs_curvatures,
             best_score = score
             best_pred = arr
             best_scene, best_obj, best_intent = scene_desc, obj_desc, intent_desc
+            best_meta = dict(pred_meta)
+            best_meta["tot_intent_hint"] = intent_hint
+            best_meta["tot_score"] = score
         print(best_pred)
     if best_pred is None:
-        return None, None, None, None
-    return best_pred, best_scene, best_obj, best_intent
+        return None, None, None, None, None
+    return best_pred, best_scene, best_obj, best_intent, best_meta
 
 
 # ------------------------------------------------
@@ -521,10 +591,15 @@ def main_loop(args, model, processor, tokenizer):
     timestamp = datetime.now().strftime("%m%d-%H%M%S")
     out_root = f"{args.model_path}_results/{args.method}/{timestamp}"
     os.makedirs(out_root, exist_ok=True)
+    action_chunk_jsonl_path = args.action_chunk_output
+    if args.save_action_chunks and not action_chunk_jsonl_path:
+        action_chunk_jsonl_path = os.path.join(out_root, "action_chunks.jsonl")
+    if args.save_action_chunks:
+        print("Action chunk JSONL:", action_chunk_jsonl_path)
     excel_rows = []#excel容器
     all_cam_images_sequence = []
    
-    for scene in scenes:
+    for scene_idx, scene in enumerate(scenes):
         token = scene["token"]
         first_sample_token = scene["first_sample_token"]
         last_sample_token = scene["last_sample_token"]
@@ -539,6 +614,8 @@ def main_loop(args, model, processor, tokenizer):
         front_camera_images = []
         ego_poses = []
         camera_params = []
+        sample_tokens = []
+        sample_timestamps = []
 
         curr_sample_token = first_sample_token
         while True:
@@ -546,6 +623,8 @@ def main_loop(args, model, processor, tokenizer):
             cam_front_data = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
             img_path = os.path.join(nusc.dataroot, cam_front_data["filename"])
             front_camera_images.append(img_path)
+            sample_tokens.append(curr_sample_token)
+            sample_timestamps.append(sample.get("timestamp", cam_front_data.get("timestamp")))
 
             pose = nusc.get("ego_pose", cam_front_data["ego_pose_token"])
             ego_poses.append(pose)
@@ -598,6 +677,8 @@ def main_loop(args, model, processor, tokenizer):
             fut_traj_world = ego_traj_world[i + OBS_LEN : i + TTL_LEN]
             obs_vel = ego_velocities[i : i + OBS_LEN]
             obs_curv = ego_curvatures[i : i + OBS_LEN]
+            fut_vel = ego_velocities[i + OBS_LEN : i + TTL_LEN]
+            fut_curv = ego_curvatures[i + OBS_LEN : i + TTL_LEN]
 
             # 对于 Qwen，传最后一帧图片路径；对于 GPT，要用 base64 列表，这里不区分，简单用最后一帧路径
             curr_image_path = obs_images_paths[-1]
@@ -610,16 +691,16 @@ def main_loop(args, model, processor, tokenizer):
 
             # ------------------ 根据 method 选择算法 ------------------
             if args.method == "cot":
-                pred_vk, scene_desc, obj_desc, intent_desc = predict_with_cot(
+                pred_vk, scene_desc, obj_desc, intent_desc, pred_meta = predict_with_cot(
                     obs_images_for_vlm, obs_vel, obs_curv, processor, model, tokenizer, args
                 )
             elif args.method == "sc":
-                pred_vk, scene_desc, obj_desc, intent_desc = predict_with_sc(
+                pred_vk, scene_desc, obj_desc, intent_desc, pred_meta = predict_with_sc(
                     obs_images_for_vlm, obs_vel, obs_curv, processor, model, tokenizer, args,
                     sc_samples=args.sc_samples
                 )
             elif args.method == "tot":
-                pred_vk, scene_desc, obj_desc, intent_desc = predict_with_tot(
+                pred_vk, scene_desc, obj_desc, intent_desc, pred_meta = predict_with_tot(
                     obs_images_for_vlm, obs_vel, obs_curv, processor, model, tokenizer, args
                 )
             else:
@@ -671,6 +752,10 @@ def main_loop(args, model, processor, tokenizer):
                 np.linalg.norm(fut_traj_world_np[:pred3_len] - pred_traj[:pred3_len], axis=1)
             )
             ade3s_list.append(ade3)
+            last_obs_v = np.linalg.norm(obs_vel[-1])
+            last_obs_k = obs_curv[-1]
+            first_step_delta_v = abs(pred_speed[0] - last_obs_v)
+            first_step_delta_k = abs(pred_curv[0] - last_obs_k)
             print(f"   → frame {i}: ADE={ade_all:.3f}, ADE1s={ade1:.3f}, ADE2s={ade2:.3f}, ADE3s={ade3:.3f}")
             pretty_print_step(
                 method=args.method,
@@ -681,6 +766,46 @@ def main_loop(args, model, processor, tokenizer):
                 frame_idx=i,
                 scene_name=name,
             )
+
+            if args.save_action_chunks:
+                try:
+                    future_action_gt = np.stack(
+                        [np.linalg.norm(fut_vel, axis=1), fut_curv],
+                        axis=1,
+                    )
+                    pred_action = np.stack([pred_speed[:pred_len], pred_curv[:pred_len]], axis=1)
+                    record = make_action_chunk_record(
+                        scene_name=name,
+                        scene_index=scene_idx,
+                        frame_idx=i,
+                        sample_token=sample_tokens[i + OBS_LEN] if i + OBS_LEN < len(sample_tokens) else None,
+                        timestamp=sample_timestamps[i + OBS_LEN] if i + OBS_LEN < len(sample_timestamps) else None,
+                        method=args.method,
+                        model_path=args.model_path,
+                        obs_velocities=obs_vel,
+                        obs_curvatures=obs_curv,
+                        future_speed_curvature_gt=future_action_gt[:FUT_LEN],
+                        predicted_speed_curvature=pred_action[:FUT_LEN],
+                        raw_qwen_text=(pred_meta or {}).get("raw_qwen_text"),
+                        retry_used=(pred_meta or {}).get("retry_used", False),
+                        retry_reason=(pred_meta or {}).get("retry_reason"),
+                        planner_guard=(pred_meta or {}).get("planner_guard"),
+                        metrics={
+                            "ade": ade_all,
+                            "ade_1s": ade1,
+                            "ade_2s": ade2,
+                            "ade_3s": ade3,
+                            "first_step_delta_v": first_step_delta_v,
+                            "first_step_delta_k": first_step_delta_k,
+                        },
+                        extra_metadata={
+                            "scene_token": token,
+                            "image_path": curr_image_path,
+                        },
+                    )
+                    append_action_chunk_jsonl(record, action_chunk_jsonl_path)
+                except Exception as e:
+                    print(f"[ActionChunkLogger] warning: failed to save frame {name}/{i}: {e}")
 
             # 可视化保存（不依赖 YOLO3D 和 OverlayTrajectory）
             if args.plot:
@@ -778,6 +903,10 @@ def parse_args():
                         help="cot: baseline; sc: self-consistency; tot: tree-of-thought")
     parser.add_argument("--sc-samples", type=int, default=5,
                         help="self-consistency 采样次数")
+    parser.add_argument("--save_action_chunks", type=lambda x: str(x).lower() == "true", default=False,
+                        help="True: append per-frame action chunk training records to JSONL")
+    parser.add_argument("--action_chunk_output", type=str, default=None,
+                        help="Path to action chunk JSONL. Defaults to <result_dir>/action_chunks.jsonl")
     parser.add_argument(
     "--use-tqdm",
     type=lambda x: str(x).lower() == "true",
