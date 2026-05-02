@@ -28,6 +28,7 @@ from .qwen_planner import (
 )
 from .action_head import (
     ContinuousActionHead,
+    EgoOnlyActionHead,
     action_chunk_l1_loss,
     build_continuous_action_head,
     denormalize_action_chunk,
@@ -58,6 +59,7 @@ __all__ = [
     "generate_with_qwen",
     "select_planning_hidden",
     "ContinuousActionHead",
+    "EgoOnlyActionHead",
     "action_chunk_l1_loss",
     "build_continuous_action_head",
     "denormalize_action_chunk",

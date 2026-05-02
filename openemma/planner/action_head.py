@@ -41,6 +41,46 @@ class ContinuousActionHead(nn.Module):
         return actions.view(-1, self.chunk_size, self.action_dim)
 
 
+class EgoOnlyActionHead(nn.Module):
+    """MLP baseline that predicts future actions from observed ego history only."""
+
+    def __init__(
+        self,
+        history_steps: int = 10,
+        ego_dim: int = 3,
+        chunk_size: int = 10,
+        action_dim: int = 2,
+        hidden_size: int = 256,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.history_steps = history_steps
+        self.ego_dim = ego_dim
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        input_dim = history_steps * ego_dim
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, chunk_size * action_dim),
+        )
+
+    def forward(self, ego_history_array: torch.Tensor) -> torch.Tensor:
+        if ego_history_array.ndim != 3:
+            raise ValueError("ego_history_array must have shape [B, history_steps, ego_dim].")
+        expected = (self.history_steps, self.ego_dim)
+        if tuple(ego_history_array.shape[1:]) != expected:
+            raise ValueError(
+                f"ego_history_array trailing shape must be {expected}, got {tuple(ego_history_array.shape[1:])}."
+            )
+        flat = ego_history_array.reshape(ego_history_array.shape[0], -1)
+        actions = self.net(flat)
+        return actions.view(-1, self.chunk_size, self.action_dim)
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
