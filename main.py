@@ -233,31 +233,58 @@ def GenerateMotion(obs_images, obs_waypoints, obs_velocities, obs_curvatures, gi
     print(f'Observed Speed and Curvature: {obs_speed_curvature_str}')
 
     sys_message = build_speed_curvature_sys_message(trailing_newline=True)
-    for rho in range(3):
+    result = None
+    guard_details = None
+    initial_guard_details = None
+    retry_count = 0
+    max_planner_retries = 3
+    for rho in range(max_planner_retries):
         result = vlm_inference(text=prompt, images=obs_images, sys_message=sys_message, processor=processor, model=model, tokenizer=tokenizer, args=args)
         parsed_result = parse_speed_curvature_text(result, max_len=FUT_LEN)
-        is_valid, reject_reasons = evaluate_speed_curvature_prediction(
+        guard_details = evaluate_speed_curvature_prediction(
             parsed_result,
             obs_velocities,
             obs_curvatures,
+            return_details=True,
         )
+        if initial_guard_details is None:
+            initial_guard_details = dict(guard_details)
+        is_valid = guard_details["is_valid"]
+        reject_reasons = guard_details["reasons"]
         has_prediction = isinstance(result, str) and not "unable" in result and not "sorry" in result and "[" in result
         if has_prediction and is_valid:
             break
         if has_prediction:
             print(f"[PlannerGuard] retrying rejected prediction: {', '.join(reject_reasons)}")
+            retry_count += 1
             retry_prompt = build_speed_curvature_retry_prompt(prompt, result, reject_reasons)
             retry_result = vlm_inference(text=retry_prompt, images=obs_images, sys_message=sys_message, processor=processor, model=model, tokenizer=tokenizer, args=args)
             retry_parsed = parse_speed_curvature_text(retry_result, max_len=FUT_LEN)
-            retry_valid, _ = evaluate_speed_curvature_prediction(
+            retry_guard_details = evaluate_speed_curvature_prediction(
                 retry_parsed,
                 obs_velocities,
                 obs_curvatures,
+                return_details=True,
             )
+            retry_valid = retry_guard_details["is_valid"]
             if isinstance(retry_result, str) and "[" in retry_result:
                 result = retry_result
+                guard_details = retry_guard_details
             if retry_valid:
                 break
+    if guard_details is None:
+        guard_details = evaluate_speed_curvature_prediction(
+            None,
+            obs_velocities,
+            obs_curvatures,
+            return_details=True,
+        )
+    if initial_guard_details is None:
+        initial_guard_details = dict(guard_details)
+    final_prediction_valid = bool(guard_details.get("is_valid", False))
+    final_reject_reasons = [] if final_prediction_valid else list(guard_details.get("reasons", []))
+    if not final_prediction_valid:
+        print(f"[PlannerGuard] final prediction still invalid after {retry_count} retries: {', '.join(final_reject_reasons)}")
     return result, scene_description, object_description, intent_description
 
 if __name__ == '__main__':

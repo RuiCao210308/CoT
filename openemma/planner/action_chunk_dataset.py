@@ -126,6 +126,15 @@ def make_action_chunk_record(
             "planner_guard": {
                 "is_valid": guard.get("is_valid"),
                 "reasons": guard.get("reasons", []),
+                "initial_is_valid": guard.get("initial_is_valid", guard.get("is_valid")),
+                "initial_reject_reasons": guard.get("initial_reject_reasons", guard.get("reasons", [])),
+                "final_prediction_valid": guard.get("final_prediction_valid", guard.get("is_valid")),
+                "final_reject_reasons": guard.get(
+                    "final_reject_reasons",
+                    [] if guard.get("is_valid") else guard.get("reasons", []),
+                ),
+                "retry_used": bool(guard.get("retry_used", retry_used)),
+                "retry_count": int(guard.get("retry_count", 1 if retry_used else 0)),
                 "repeated_pair_ratio": guard.get("repeated_pair_ratio"),
                 "history_overlap_ratio": guard.get("history_overlap_ratio"),
                 "flat_repeat_detected": guard.get("flat_repeat_detected"),

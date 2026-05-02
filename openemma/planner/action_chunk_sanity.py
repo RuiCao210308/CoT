@@ -170,6 +170,9 @@ def check_action_chunk_jsonl(
             "present": 0,
             "invalid": 0,
             "retry_used": 0,
+            "retry_count": [],
+            "final_invalid": 0,
+            "retry_exhausted_invalid": 0,
             "reason_counts": Counter(),
             "repeated_pair_ratio": [],
             "history_overlap_ratio": [],
@@ -267,14 +270,27 @@ def check_action_chunk_jsonl(
             summary["planner_guard"]["present"] += 1
             if guard.get("is_valid") is False:
                 summary["planner_guard"]["invalid"] += 1
+            final_prediction_valid = guard.get("final_prediction_valid", guard.get("is_valid"))
+            if final_prediction_valid is False:
+                summary["planner_guard"]["final_invalid"] += 1
             for reason in guard.get("reasons") or []:
                 summary["planner_guard"]["reason_counts"][str(reason)] += 1
             if guard.get("flat_repeat_detected"):
                 summary["planner_guard"]["flat_repeat_detected"] += 1
+            retry_count = guard.get("retry_count")
+            if retry_count is None:
+                retry_count = 1 if (guard.get("retry_used") or prediction.get("retry_used")) else 0
+            try:
+                retry_count = int(retry_count)
+            except (TypeError, ValueError):
+                retry_count = 0
+            summary["planner_guard"]["retry_count"].append(retry_count)
+            if retry_count > 0 and final_prediction_valid is False:
+                summary["planner_guard"]["retry_exhausted_invalid"] += 1
             for key in ("repeated_pair_ratio", "history_overlap_ratio"):
                 if guard.get(key) is not None:
                     summary["planner_guard"][key].append(guard.get(key))
-        if prediction.get("retry_used"):
+        if prediction.get("retry_used") or guard.get("retry_used"):
             summary["planner_guard"]["retry_used"] += 1
 
         for key, value in (record.get("metrics") or {}).items():
@@ -292,7 +308,12 @@ def finalize_action_chunk_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     guard = summary["planner_guard"]
     guard["trigger_rate"] = (guard["invalid"] / records) if records else None
     guard["retry_rate"] = (guard["retry_used"] / records) if records else None
+    guard["final_invalid_rate"] = (guard["final_invalid"] / records) if records else None
+    guard["retry_exhausted_invalid_rate"] = (
+        guard["retry_exhausted_invalid"] / records
+    ) if records else None
     guard["reason_counts"] = dict(guard["reason_counts"])
+    guard["retry_count"] = numeric_stats(guard["retry_count"])
     guard["repeated_pair_ratio"] = numeric_stats(guard["repeated_pair_ratio"])
     guard["history_overlap_ratio"] = numeric_stats(guard["history_overlap_ratio"])
 
@@ -329,7 +350,16 @@ def format_action_chunk_summary(summary: Dict[str, Any]) -> str:
             "  planner_guard: "
             f"present={guard['present']}, invalid={guard['invalid']}, "
             f"trigger_rate={_format_rate(guard['trigger_rate'])}, retry_rate={_format_rate(guard['retry_rate'])}, "
+            f"final_invalid={guard['final_invalid']}, final_invalid_rate={_format_rate(guard['final_invalid_rate'])}, "
+            f"retry_exhausted_invalid={guard['retry_exhausted_invalid']}, "
+            f"retry_exhausted_invalid_rate={_format_rate(guard['retry_exhausted_invalid_rate'])}, "
             f"flat_repeat_detected={guard['flat_repeat_detected']}, reasons={guard['reason_counts']}"
+        ),
+        (
+            "  planner_guard.retry_count: "
+            f"count={guard['retry_count']['count']}, mean={_fmt(guard['retry_count']['mean'])}, "
+            f"p50={_fmt(guard['retry_count']['p50'])}, p90={_fmt(guard['retry_count']['p90'])}, "
+            f"max={_fmt(guard['retry_count']['max'])}"
         ),
     ]
     for metric in ("ade", "ade_1s", "ade_2s", "ade_3s"):

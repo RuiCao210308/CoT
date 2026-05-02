@@ -43,9 +43,14 @@ from openemma.planner import (
     build_speed_curvature_prompt,
     build_speed_curvature_retry_prompt,
     build_speed_curvature_sys_message,
+    build_qwen_inputs,
+    debug_qwen_hidden_shapes,
     evaluate_speed_curvature_prediction,
+    extract_qwen_hidden_states,
     format_obs_speed_curvature as planner_format_obs_speed_curvature,
+    generate_with_qwen,
     parse_speed_curvature_text as planner_parse_speed_curvature_text,
+    select_planning_hidden,
     standardize_speed_curvature_output,
 )
 from openemma.planner.action_chunk_dataset import (
@@ -232,32 +237,50 @@ def vlm_inference(text=None, images=None, sys_message=None,
     """
     # Qwen 系列
     if "qwen" in args.model_path or "Qwen" in args.model_path:
-        message = getMessage(text, image=images, args=args)
-        text_prompt = processor.apply_chat_template(
-            message, tokenize=False, add_generation_prompt=True
+        inputs = build_qwen_inputs(
+            prompt=text,
+            images=images,
+            processor=processor,
+            model=model,
+            args=args,
+            get_message_fn=getMessage,
+            process_vision_info_fn=process_vision_info,
         )
-        image_inputs, video_inputs = process_vision_info(message)
-        inputs = processor(
-            text=[text_prompt],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        ).to(model.device)
-        generated_ids = model.generate(
-            **inputs,
+        generated_text = generate_with_qwen(
+            inputs=inputs,
+            processor=processor,
+            model=model,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
         )
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_text = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+
+        should_debug_hidden = (
+            getattr(args, "debug_hidden_state", False)
+            and not getattr(args, "_debug_hidden_state_printed", False)
+            and isinstance(text, str)
+            and "Future speeds and curvatures:" in text
         )
-        return output_text[0]
+        if should_debug_hidden:
+            try:
+                last_hidden_state = extract_qwen_hidden_states(inputs, model)
+                planning_hidden = select_planning_hidden(
+                    last_hidden_state,
+                    inputs["attention_mask"],
+                )
+                debug_qwen_hidden_shapes(
+                    inputs,
+                    last_hidden_state,
+                    planning_hidden,
+                    generated_text,
+                )
+                setattr(args, "_debug_hidden_state_printed", True)
+            except Exception as exc:
+                print(f"[QwenHiddenDebug] warning: hidden extraction failed: {exc}")
+                setattr(args, "_debug_hidden_state_printed", True)
+
+        return generated_text
 
     # GPT-4o 模式（多图）
     if "gpt" in args.model_path:
@@ -393,9 +416,12 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
 
     raw = None
     guard_details = None
+    initial_guard_details = None
     retry_used = False
     retry_reason = None
-    for _ in range(3):
+    retry_count = 0
+    max_planner_retries = 3
+    for _ in range(max_planner_retries):
         raw = vlm_inference(
             text=prompt,
             images=obs_images,
@@ -415,6 +441,8 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
             obs_curvatures,
             return_details=True,
         )
+        if initial_guard_details is None:
+            initial_guard_details = dict(guard_details)
         is_valid = guard_details["is_valid"]
         reject_reasons = guard_details["reasons"]
         if isinstance(raw, str) and "[" in raw and is_valid:
@@ -422,6 +450,7 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
         if isinstance(raw, str) and "[" in raw:
             print(f"[PlannerGuard] retrying rejected prediction: {', '.join(reject_reasons)}")
             retry_used = True
+            retry_count += 1
             retry_reason = ", ".join(reject_reasons)
             retry_prompt = build_speed_curvature_retry_prompt(prompt, raw, reject_reasons)
             retry_raw = vlm_inference(
@@ -449,6 +478,26 @@ def generate_motion_single(obs_images, obs_velocities, obs_curvatures,
                 guard_details = retry_guard_details
             if retry_valid:
                 break
+    if guard_details is None:
+        guard_details = evaluate_speed_curvature_prediction(
+            None,
+            obs_velocities,
+            obs_curvatures,
+            return_details=True,
+        )
+    if initial_guard_details is None:
+        initial_guard_details = dict(guard_details)
+    guard_details = dict(guard_details)
+    guard_details.update(
+        {
+            "initial_is_valid": bool(initial_guard_details.get("is_valid", False)),
+            "initial_reject_reasons": list(initial_guard_details.get("reasons", [])),
+            "final_prediction_valid": bool(guard_details.get("is_valid", False)),
+            "final_reject_reasons": [] if guard_details.get("is_valid", False) else list(guard_details.get("reasons", [])),
+            "retry_used": bool(retry_used),
+            "retry_count": int(retry_count),
+        }
+    )
     metadata = {
         "raw_qwen_text": raw,
         "retry_used": retry_used,
@@ -907,6 +956,8 @@ def parse_args():
                         help="True: append per-frame action chunk training records to JSONL")
     parser.add_argument("--action_chunk_output", type=str, default=None,
                         help="Path to action chunk JSONL. Defaults to <result_dir>/action_chunks.jsonl")
+    parser.add_argument("--debug_hidden_state", type=lambda x: str(x).lower() == "true", default=False,
+                        help="True: print one Qwen hidden-state shape summary for the planning prompt")
     parser.add_argument(
     "--use-tqdm",
     type=lambda x: str(x).lower() == "true",

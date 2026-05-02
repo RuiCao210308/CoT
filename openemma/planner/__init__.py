@@ -19,6 +19,13 @@ from .action_chunk_sanity import (
     numeric_stats,
     save_action_chunk_report,
 )
+from .qwen_planner import (
+    build_qwen_inputs,
+    debug_qwen_hidden_shapes,
+    extract_qwen_hidden_states,
+    generate_with_qwen,
+    select_planning_hidden,
+)
 
 __all__ = [
     "PlannerInput",
@@ -38,4 +45,9 @@ __all__ = [
     "format_action_chunk_summary",
     "numeric_stats",
     "save_action_chunk_report",
+    "build_qwen_inputs",
+    "debug_qwen_hidden_shapes",
+    "extract_qwen_hidden_states",
+    "generate_with_qwen",
+    "select_planning_hidden",
 ]
