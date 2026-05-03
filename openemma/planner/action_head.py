@@ -157,6 +157,103 @@ class FusionActionHead(nn.Module):
         return actions.view(-1, self.chunk_size, self.action_dim)
 
 
+class DecoupledEgoVLAActionHead(nn.Module):
+    """Ego-grounded VLA action head with decoupled speed and curvature predictors."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        history_steps: int = 10,
+        ego_dim: int = 3,
+        qwen_embed_dim: int = 512,
+        ego_embed_dim: int = 256,
+        fusion_dim: int = 1024,
+        speed_hidden: int = 512,
+        curvature_hidden: int = 512,
+        chunk_size: int = 10,
+        action_dim: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.history_steps = history_steps
+        self.ego_dim = ego_dim
+        self.qwen_embed_dim = qwen_embed_dim
+        self.ego_embed_dim = ego_embed_dim
+        self.fusion_dim = fusion_dim
+        self.speed_hidden = speed_hidden
+        self.curvature_hidden = curvature_hidden
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+
+        ego_input_dim = history_steps * ego_dim
+        self.qwen_projection = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, qwen_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.ego_encoder = nn.Sequential(
+            nn.LayerNorm(ego_input_dim),
+            nn.Linear(ego_input_dim, ego_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fusion_trunk = nn.Sequential(
+            nn.Linear(qwen_embed_dim + ego_embed_dim, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.GELU(),
+        )
+        self.speed_head = nn.Sequential(
+            nn.Linear(fusion_dim, speed_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(speed_hidden, chunk_size),
+        )
+        self.curvature_head = nn.Sequential(
+            nn.Linear(fusion_dim, curvature_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(curvature_hidden, chunk_size),
+        )
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+    ) -> torch.Tensor:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, "
+                f"got {planning_hidden.shape[-1]}."
+            )
+        if ego_history_array.ndim != 3:
+            raise ValueError("ego_history_array must have shape [B, history_steps, ego_dim].")
+        expected = (self.history_steps, self.ego_dim)
+        if tuple(ego_history_array.shape[1:]) != expected:
+            raise ValueError(
+                f"ego_history_array trailing shape must be {expected}, "
+                f"got {tuple(ego_history_array.shape[1:])}."
+            )
+        if planning_hidden.shape[0] != ego_history_array.shape[0]:
+            raise ValueError("planning_hidden and ego_history_array must have the same batch size.")
+        if self.action_dim != 2:
+            raise ValueError("DecoupledEgoVLAActionHead currently expects action_dim=2.")
+
+        qwen_embed = self.qwen_projection(planning_hidden)
+        ego_flat = ego_history_array.reshape(ego_history_array.shape[0], -1)
+        ego_embed = self.ego_encoder(ego_flat)
+        fused = torch.cat([qwen_embed, ego_embed], dim=-1)
+        trunk = self.fusion_trunk(fused)
+        speed = self.speed_head(trunk).unsqueeze(-1)
+        curvature = self.curvature_head(trunk).unsqueeze(-1)
+        return torch.cat([speed, curvature], dim=-1)
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
@@ -191,6 +288,34 @@ def build_fusion_action_head(
         ego_embed_dim=ego_embed_dim,
         qwen_embed_dim=qwen_embed_dim,
         fusion_hidden_size=fusion_hidden_size,
+        chunk_size=chunk_size,
+        action_dim=action_dim,
+        dropout=dropout,
+    )
+
+
+def build_decoupled_egovla_action_head(
+    qwen_hidden_dim: int = 3584,
+    history_steps: int = 10,
+    ego_dim: int = 3,
+    qwen_embed_dim: int = 512,
+    ego_embed_dim: int = 256,
+    fusion_dim: int = 1024,
+    speed_hidden: int = 512,
+    curvature_hidden: int = 512,
+    chunk_size: int = 10,
+    action_dim: int = 2,
+    dropout: float = 0.1,
+) -> DecoupledEgoVLAActionHead:
+    return DecoupledEgoVLAActionHead(
+        qwen_hidden_dim=qwen_hidden_dim,
+        history_steps=history_steps,
+        ego_dim=ego_dim,
+        qwen_embed_dim=qwen_embed_dim,
+        ego_embed_dim=ego_embed_dim,
+        fusion_dim=fusion_dim,
+        speed_hidden=speed_hidden,
+        curvature_hidden=curvature_hidden,
         chunk_size=chunk_size,
         action_dim=action_dim,
         dropout=dropout,

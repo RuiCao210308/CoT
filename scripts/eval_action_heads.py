@@ -16,7 +16,12 @@ PLANNER_DIR = os.path.join(REPO_ROOT, "openemma", "planner")
 if PLANNER_DIR not in sys.path:
     sys.path.insert(0, PLANNER_DIR)
 
-from action_head import ContinuousActionHead, EgoOnlyActionHead, FusionActionHead
+from action_head import (
+    ContinuousActionHead,
+    DecoupledEgoVLAActionHead,
+    EgoOnlyActionHead,
+    FusionActionHead,
+)
 from qwen_planner import (
     build_qwen_inputs,
     extract_qwen_hidden_states,
@@ -27,7 +32,7 @@ from train_action_head import load_qwen_model_and_processor
 
 SOURCE_ACTION_SCHEMA = ["speed_mps", "curvature_1pm"]
 TRAIN_ACTION_SCHEMA = ["speed_mps", "curvature_x100"]
-MODEL_TYPES = ("ego_only", "qwen_hidden", "fusion")
+MODEL_TYPES = ("ego_only", "qwen_hidden", "fusion", "decoupled_egovla")
 
 
 def parse_args():
@@ -143,14 +148,14 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "target_physical": targets["physical"],
         }
 
-        if args.model_type in ("ego_only", "fusion"):
+        if args.model_type in ("ego_only", "fusion", "decoupled_egovla"):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
                 skipped["invalid_input_ego_history_array"] += 1
                 continue
             sample["ego_history"] = ego_history.unsqueeze(0)
 
-        if args.model_type in ("qwen_hidden", "fusion"):
+        if args.model_type in ("qwen_hidden", "fusion", "decoupled_egovla"):
             prompt_fields = get_prompt_fields(record)
             if prompt_fields is None:
                 skipped["missing_input_system_or_planning_prompt"] += 1
@@ -221,6 +226,32 @@ def load_fusion_head(checkpoint: Dict[str, Any], device: torch.device) -> Fusion
     state_dict = checkpoint.get("fusion_action_head_state_dict") or checkpoint.get("state_dict")
     if state_dict is None:
         raise KeyError("checkpoint missing fusion_action_head_state_dict")
+    head.load_state_dict(state_dict)
+    head.eval()
+    return head
+
+
+def load_decoupled_egovla_head(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> DecoupledEgoVLAActionHead:
+    config = checkpoint.get("config", {})
+    head = DecoupledEgoVLAActionHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        fusion_dim=int(config.get("fusion_dim", 1024)),
+        speed_hidden=int(config.get("speed_hidden", 512)),
+        curvature_hidden=int(config.get("curvature_hidden", 512)),
+        chunk_size=int(config.get("chunk_size", 10)),
+        action_dim=int(config.get("action_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    state_dict = checkpoint.get("decoupled_egovla_head_state_dict") or checkpoint.get("state_dict")
+    if state_dict is None:
+        raise KeyError("checkpoint missing decoupled_egovla_head_state_dict")
     head.load_state_dict(state_dict)
     head.eval()
     return head
@@ -390,6 +421,31 @@ def evaluate_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
     return sums
 
 
+def evaluate_decoupled_egovla(args, samples: List[Dict[str, Any]], device: torch.device):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    head = load_decoupled_egovla_head(checkpoint, device)
+    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    sums = Counter()
+    with torch.no_grad():
+        for sample in samples:
+            inputs = build_qwen_inputs(
+                prompt=sample["planning_prompt"],
+                images=sample["image_path"],
+                processor=processor,
+                model=qwen_model,
+                args=args,
+                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+            )
+            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            pred_train = head(planning_hidden, ego_history)
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            update_metric_sums(sums, pred_train, target_train)
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -412,8 +468,10 @@ def main():
         sums = evaluate_ego_only(args, samples, device)
     elif args.model_type == "qwen_hidden":
         sums = evaluate_qwen_hidden(args, samples, device)
-    else:
+    elif args.model_type == "fusion":
         sums = evaluate_fusion(args, samples, device)
+    else:
+        sums = evaluate_decoupled_egovla(args, samples, device)
 
     metrics = finalize_metrics(args, len(records), skipped, sums)
     print_summary(metrics)
