@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 
@@ -30,7 +32,7 @@ def waypoint_fde(pred_waypoints: torch.Tensor, target_waypoints: torch.Tensor) -
 def waypoint_longitudinal_lateral_mae(
     pred_waypoints: torch.Tensor,
     target_waypoints: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     _validate_waypoints(pred_waypoints, target_waypoints)
     abs_error = torch.abs(pred_waypoints - target_waypoints)
     return abs_error[..., 0].mean(), abs_error[..., 1].mean()

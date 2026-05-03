@@ -1,3 +1,5 @@
+from typing import Dict
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -318,7 +320,7 @@ class WaypointAuxFusionHead(nn.Module):
         self,
         planning_hidden: torch.Tensor,
         ego_history_array: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         if planning_hidden.ndim != 2:
             raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
         if planning_hidden.shape[-1] != self.qwen_hidden_dim:
