@@ -30,6 +30,7 @@ from qwen_planner import (
 )
 from train_action_head import load_qwen_model_and_processor
 from waypoint_metrics import (
+    derive_action_from_waypoints,
     waypoint_ade,
     waypoint_fde,
     waypoint_l1_loss,
@@ -45,6 +46,7 @@ MODEL_TYPES = (
     "fusion",
     "decoupled_egovla",
     "waypoint_aux_fusion",
+    "waypoint_consistency_fusion",
 )
 
 
@@ -59,6 +61,8 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=100, help="0 means no limit after start_index.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_json", type=str, default=None)
+    parser.add_argument("--dt", type=float, default=None, help="Waypoint-to-action dt; defaults to checkpoint config then 0.5.")
+    parser.add_argument("--max_abs_curvature_1pm", type=float, default=0.2)
     return parser.parse_args()
 
 
@@ -171,14 +175,26 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "target_physical": targets["physical"],
         }
 
-        if args.model_type in ("ego_only", "fusion", "decoupled_egovla", "waypoint_aux_fusion"):
+        if args.model_type in (
+            "ego_only",
+            "fusion",
+            "decoupled_egovla",
+            "waypoint_aux_fusion",
+            "waypoint_consistency_fusion",
+        ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
                 skipped["invalid_input_ego_history_array"] += 1
                 continue
             sample["ego_history"] = ego_history.unsqueeze(0)
 
-        if args.model_type in ("qwen_hidden", "fusion", "decoupled_egovla", "waypoint_aux_fusion"):
+        if args.model_type in (
+            "qwen_hidden",
+            "fusion",
+            "decoupled_egovla",
+            "waypoint_aux_fusion",
+            "waypoint_consistency_fusion",
+        ):
             prompt_fields = get_prompt_fields(record)
             if prompt_fields is None:
                 skipped["missing_input_system_or_planning_prompt"] += 1
@@ -190,7 +206,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             sample.update(prompt_fields)
             sample["image_path"] = image_path
 
-        if args.model_type == "waypoint_aux_fusion":
+        if args.model_type in ("waypoint_aux_fusion", "waypoint_consistency_fusion"):
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -312,6 +328,15 @@ def load_waypoint_aux_fusion_head(
     return head
 
 
+def resolve_consistency_dt(args, checkpoint: Dict[str, Any]) -> float:
+    if args.dt is not None:
+        return float(args.dt)
+    config = checkpoint.get("config", {})
+    if "dt" in config:
+        return float(config["dt"])
+    return 0.5
+
+
 def qwen_eval_message_builder(system_message: str):
     def _get_message(prompt, image=None, args=None):
         return [
@@ -376,6 +401,30 @@ def update_waypoint_metric_sums(
     sums["waypoint_y_abs_sum"] += float(y_mae) * int(pred_waypoints.shape[0] * pred_waypoints.shape[1])
 
 
+def update_consistency_metric_sums(
+    sums: Dict[str, float],
+    pred_train: torch.Tensor,
+    pred_waypoints: torch.Tensor,
+    dt: float,
+    max_abs_curvature_1pm: float,
+):
+    derived_action = derive_action_from_waypoints(
+        pred_waypoints,
+        dt=dt,
+        max_abs_curvature_1pm=max_abs_curvature_1pm,
+    )
+    pred_train = pred_train.detach().float().cpu()
+    derived_action = derived_action.detach().float().cpu()
+    abs_error = torch.abs(pred_train - derived_action)
+    sums["consistency_points"] += int(pred_train.shape[0] * pred_train.shape[1])
+    sums["consistency_values"] += int(abs_error.numel())
+    sums["consistency_abs_train_scale"] += float(abs_error.sum())
+    sums["derived_speed_abs_vs_pred"] += float(abs_error[..., 0].sum())
+    sums["derived_curvature_abs_x100_vs_pred"] += float(abs_error[..., 1].sum())
+    sums["consistency_dt"] = float(dt)
+    sums["max_abs_curvature_1pm"] = float(max_abs_curvature_1pm)
+
+
 def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str, float]) -> Dict[str, Any]:
     num_points = int(sums["points"])
     num_action_values = int(sums["action_values"])
@@ -404,6 +453,11 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "waypoint_fde": None,
         "waypoint_x_mae": None,
         "waypoint_y_mae": None,
+        "dt": sums.get("consistency_dt", args.dt),
+        "max_abs_curvature_1pm": sums.get("max_abs_curvature_1pm", args.max_abs_curvature_1pm),
+        "consistency_l1_train_scale": None,
+        "derived_speed_mae_vs_pred_mps": None,
+        "derived_curvature_mae_x100_vs_pred": None,
     }
     if num_points == 0:
         return metrics
@@ -423,6 +477,14 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         metrics["waypoint_fde"] = sums["waypoint_fde_sum"] / waypoint_samples
         metrics["waypoint_x_mae"] = sums["waypoint_x_abs_sum"] / waypoint_points
         metrics["waypoint_y_mae"] = sums["waypoint_y_abs_sum"] / waypoint_points
+    consistency_points = int(sums["consistency_points"])
+    consistency_values = int(sums["consistency_values"])
+    if consistency_points > 0 and consistency_values > 0:
+        metrics["consistency_l1_train_scale"] = sums["consistency_abs_train_scale"] / consistency_values
+        metrics["derived_speed_mae_vs_pred_mps"] = sums["derived_speed_abs_vs_pred"] / consistency_points
+        metrics["derived_curvature_mae_x100_vs_pred"] = (
+            sums["derived_curvature_abs_x100_vs_pred"] / consistency_points
+        )
     return metrics
 
 
@@ -442,6 +504,12 @@ def print_summary(metrics: Dict[str, Any]):
         print(f"waypoint_fde={metrics['waypoint_fde']}")
         print(f"waypoint_x_mae={metrics['waypoint_x_mae']}")
         print(f"waypoint_y_mae={metrics['waypoint_y_mae']}")
+    if metrics.get("consistency_l1_train_scale") is not None:
+        print(f"dt={metrics['dt']}")
+        print(f"max_abs_curvature_1pm={metrics['max_abs_curvature_1pm']}")
+        print(f"consistency_l1_train_scale={metrics['consistency_l1_train_scale']}")
+        print(f"derived_speed_mae_vs_pred_mps={metrics['derived_speed_mae_vs_pred_mps']}")
+        print(f"derived_curvature_mae_x100_vs_pred={metrics['derived_curvature_mae_x100_vs_pred']}")
 
 
 def save_report(metrics: Dict[str, Any], output_json: Optional[str]):
@@ -569,6 +637,43 @@ def evaluate_waypoint_aux_fusion(args, samples: List[Dict[str, Any]], device: to
     return sums
 
 
+def evaluate_waypoint_consistency_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    head = load_waypoint_aux_fusion_head(checkpoint, device)
+    dt = resolve_consistency_dt(args, checkpoint)
+    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    sums = Counter()
+    with torch.no_grad():
+        for sample in samples:
+            inputs = build_qwen_inputs(
+                prompt=sample["planning_prompt"],
+                images=sample["image_path"],
+                processor=processor,
+                model=qwen_model,
+                args=args,
+                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+            )
+            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            outputs = head(planning_hidden, ego_history)
+            pred_train = outputs["action_chunk"]
+            pred_waypoints = outputs["waypoints"]
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            update_metric_sums(sums, pred_train, target_train)
+            target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_waypoints.dtype)
+            update_waypoint_metric_sums(sums, pred_waypoints, target_waypoints)
+            update_consistency_metric_sums(
+                sums,
+                pred_train,
+                pred_waypoints,
+                dt=dt,
+                max_abs_curvature_1pm=args.max_abs_curvature_1pm,
+            )
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -595,8 +700,10 @@ def main():
         sums = evaluate_fusion(args, samples, device)
     elif args.model_type == "decoupled_egovla":
         sums = evaluate_decoupled_egovla(args, samples, device)
-    else:
+    elif args.model_type == "waypoint_aux_fusion":
         sums = evaluate_waypoint_aux_fusion(args, samples, device)
+    else:
+        sums = evaluate_waypoint_consistency_fusion(args, samples, device)
 
     metrics = finalize_metrics(args, len(records), skipped, sums)
     print_summary(metrics)

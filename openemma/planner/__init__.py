@@ -41,6 +41,8 @@ from .action_head import (
     normalize_action_chunk,
 )
 from .waypoint_metrics import (
+    derive_action_from_waypoints,
+    waypoint_action_consistency_loss,
     waypoint_ade,
     waypoint_fde,
     waypoint_l1_loss,
@@ -82,6 +84,8 @@ __all__ = [
     "build_waypoint_aux_fusion_head",
     "denormalize_action_chunk",
     "normalize_action_chunk",
+    "derive_action_from_waypoints",
+    "waypoint_action_consistency_loss",
     "waypoint_ade",
     "waypoint_fde",
     "waypoint_l1_loss",

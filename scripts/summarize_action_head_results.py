@@ -18,6 +18,9 @@ RESULT_COLUMNS = [
     "waypoint_fde",
     "waypoint_x_mae",
     "waypoint_y_mae",
+    "consistency_l1_train_scale",
+    "derived_speed_mae_vs_pred_mps",
+    "derived_curvature_mae_x100_vs_pred",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -39,6 +42,8 @@ def parse_args():
     parser.add_argument("--fusion_heldout_json", type=str, default="/root/autodl-tmp/eval_fusion_heldout.json")
     parser.add_argument("--waypoint_aux_train_json", type=str, default=None)
     parser.add_argument("--waypoint_aux_heldout_json", type=str, default=None)
+    parser.add_argument("--waypoint_consistency_train_json", type=str, default=None)
+    parser.add_argument("--waypoint_consistency_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -69,6 +74,9 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "waypoint_fde": data.get("waypoint_fde"),
         "waypoint_x_mae": data.get("waypoint_x_mae"),
         "waypoint_y_mae": data.get("waypoint_y_mae"),
+        "consistency_l1_train_scale": data.get("consistency_l1_train_scale"),
+        "derived_speed_mae_vs_pred_mps": data.get("derived_speed_mae_vs_pred_mps"),
+        "derived_curvature_mae_x100_vs_pred": data.get("derived_curvature_mae_x100_vs_pred"),
     }
 
 
@@ -297,6 +305,24 @@ def main():
                 "held-out",
                 args.waypoint_aux_heldout_json,
                 "waypoint aux held-out",
+            )
+        )
+    if args.waypoint_consistency_train_json:
+        entries.append(
+            (
+                "waypoint-consistency-fusion",
+                "train",
+                args.waypoint_consistency_train_json,
+                "waypoint consistency train",
+            )
+        )
+    if args.waypoint_consistency_heldout_json:
+        entries.append(
+            (
+                "waypoint-consistency-fusion",
+                "held-out",
+                args.waypoint_consistency_heldout_json,
+                "waypoint consistency held-out",
             )
         )
 
