@@ -81,6 +81,82 @@ class EgoOnlyActionHead(nn.Module):
         return actions.view(-1, self.chunk_size, self.action_dim)
 
 
+class FusionActionHead(nn.Module):
+    """Fuse Qwen planning hidden state with structured ego history for action chunks."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        history_steps: int = 10,
+        ego_dim: int = 3,
+        ego_embed_dim: int = 256,
+        qwen_embed_dim: int = 512,
+        fusion_hidden_size: int = 1024,
+        chunk_size: int = 10,
+        action_dim: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.history_steps = history_steps
+        self.ego_dim = ego_dim
+        self.ego_embed_dim = ego_embed_dim
+        self.qwen_embed_dim = qwen_embed_dim
+        self.fusion_hidden_size = fusion_hidden_size
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+
+        ego_input_dim = history_steps * ego_dim
+        self.ego_encoder = nn.Sequential(
+            nn.LayerNorm(ego_input_dim),
+            nn.Linear(ego_input_dim, ego_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.qwen_projection = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, qwen_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(qwen_embed_dim + ego_embed_dim, fusion_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_hidden_size, chunk_size * action_dim),
+        )
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+    ) -> torch.Tensor:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, "
+                f"got {planning_hidden.shape[-1]}."
+            )
+        if ego_history_array.ndim != 3:
+            raise ValueError("ego_history_array must have shape [B, history_steps, ego_dim].")
+        expected = (self.history_steps, self.ego_dim)
+        if tuple(ego_history_array.shape[1:]) != expected:
+            raise ValueError(
+                f"ego_history_array trailing shape must be {expected}, "
+                f"got {tuple(ego_history_array.shape[1:])}."
+            )
+        if planning_hidden.shape[0] != ego_history_array.shape[0]:
+            raise ValueError("planning_hidden and ego_history_array must have the same batch size.")
+
+        ego_flat = ego_history_array.reshape(ego_history_array.shape[0], -1)
+        ego_embed = self.ego_encoder(ego_flat)
+        qwen_embed = self.qwen_projection(planning_hidden)
+        fused = torch.cat([qwen_embed, ego_embed], dim=-1)
+        actions = self.fusion(fused)
+        return actions.view(-1, self.chunk_size, self.action_dim)
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
@@ -93,6 +169,30 @@ def build_continuous_action_head(
         chunk_size=chunk_size,
         action_dim=action_dim,
         hidden_size=hidden_size,
+        dropout=dropout,
+    )
+
+
+def build_fusion_action_head(
+    qwen_hidden_dim: int = 3584,
+    history_steps: int = 10,
+    ego_dim: int = 3,
+    ego_embed_dim: int = 256,
+    qwen_embed_dim: int = 512,
+    fusion_hidden_size: int = 1024,
+    chunk_size: int = 10,
+    action_dim: int = 2,
+    dropout: float = 0.1,
+) -> FusionActionHead:
+    return FusionActionHead(
+        qwen_hidden_dim=qwen_hidden_dim,
+        history_steps=history_steps,
+        ego_dim=ego_dim,
+        ego_embed_dim=ego_embed_dim,
+        qwen_embed_dim=qwen_embed_dim,
+        fusion_hidden_size=fusion_hidden_size,
+        chunk_size=chunk_size,
+        action_dim=action_dim,
         dropout=dropout,
     )
 
