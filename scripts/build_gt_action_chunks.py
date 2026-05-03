@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from nuscenes import NuScenes
+from pyquaternion import Quaternion
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -164,6 +165,27 @@ def stable_estimate_speed_curvature(
     return velocities, curvatures, clipped_mask, stats
 
 
+def compute_future_waypoints_local(
+    current_ego_pose: Dict[str, Any],
+    future_ego_poses: List[Dict[str, Any]],
+) -> np.ndarray:
+    """Transform future global ego positions into the current ego frame.
+
+    nuScenes ego_pose rotation maps ego-local coordinates to global coordinates.
+    Therefore R_current.T maps a global displacement into current ego-local
+    coordinates, where +x is current ego forward and +y is current ego left.
+    """
+    current_translation = np.asarray(current_ego_pose["translation"][:3], dtype=np.float64)
+    current_rotation = Quaternion(current_ego_pose["rotation"]).rotation_matrix
+    waypoints = []
+    for future_pose in future_ego_poses:
+        future_translation = np.asarray(future_pose["translation"][:3], dtype=np.float64)
+        rel_global = future_translation - current_translation
+        rel_local = current_rotation.T @ rel_global
+        waypoints.append(rel_local[:2])
+    return np.asarray(waypoints, dtype=np.float32)
+
+
 def build_gt_record(
     args,
     scene: Dict[str, Any],
@@ -176,6 +198,7 @@ def build_gt_record(
     obs_curvatures: np.ndarray,
     future_velocities: np.ndarray,
     future_curvatures: np.ndarray,
+    future_waypoints_local: np.ndarray,
     curvature_clipped: bool = False,
 ):
     system_message = build_speed_curvature_sys_message(article="an")
@@ -222,6 +245,8 @@ def build_gt_record(
         "target": {
             "future_action_gt": future_action_gt,
             "future_action_schema": ["speed_mps", "curvature_1pm"],
+            "future_waypoints_local": future_waypoints_local.astype(np.float32),
+            "future_waypoints_schema": ["x_m_local", "y_m_local"],
         },
         "prediction": {
             "qwen_predicted_action": None,
@@ -249,6 +274,14 @@ def validate_record(record: Dict[str, Any], history_steps: int, future_steps: in
     if future_gt.shape != (future_steps, 2) or not np.isfinite(future_gt).all():
         return False, "invalid_future_action_gt"
 
+    future_waypoints = np.asarray(record.get("target", {}).get("future_waypoints_local"), dtype=np.float32)
+    if future_waypoints.shape != (future_steps, 2):
+        return False, "invalid_future_waypoints_shape"
+    if not np.isfinite(future_waypoints).all():
+        return False, "invalid_future_waypoints_nonfinite"
+    if record.get("target", {}).get("future_waypoints_schema") != ["x_m_local", "y_m_local"]:
+        return False, "invalid_future_waypoints_schema"
+
     if future_steps != 10:
         return False, "future_steps_must_be_10_for_train_action_head"
 
@@ -269,6 +302,13 @@ def build_gt_action_chunks(args):
     nusc = NuScenes(version=args.version, dataroot=args.dataroot)
     skipped = Counter()
     motion_stats = Counter()
+    waypoint_stats = {
+        "waypoint_nonfinite_count": 0,
+        "waypoint_bad_shape_count": 0,
+        "waypoint_max_abs_x": 0.0,
+        "waypoint_max_abs_y": 0.0,
+        "waypoint_max_distance": 0.0,
+    }
     total_candidates = 0
     written = 0
 
@@ -311,6 +351,37 @@ def build_gt_action_chunks(args):
             if args.skip_if_extreme_curvature and future_clipped:
                 skipped["skipped_by_extreme_curvature"] += 1
                 continue
+            future_poses = ego_poses[current_idx + 1 : current_idx + 1 + args.future_steps]
+            if len(future_poses) != args.future_steps:
+                skipped["insufficient_future_waypoints"] += 1
+                continue
+            future_waypoints_local = compute_future_waypoints_local(
+                ego_poses[current_idx],
+                future_poses,
+            )
+            if future_waypoints_local.shape != (args.future_steps, 2):
+                waypoint_stats["waypoint_bad_shape_count"] += 1
+                skipped["invalid_future_waypoints_shape"] += 1
+                continue
+            if not np.isfinite(future_waypoints_local).all():
+                waypoint_stats["waypoint_nonfinite_count"] += int(
+                    future_waypoints_local.size - np.count_nonzero(np.isfinite(future_waypoints_local))
+                )
+                skipped["invalid_future_waypoints_nonfinite"] += 1
+                continue
+            waypoint_distances = np.linalg.norm(future_waypoints_local, axis=1)
+            waypoint_stats["waypoint_max_abs_x"] = max(
+                waypoint_stats["waypoint_max_abs_x"],
+                float(np.max(np.abs(future_waypoints_local[:, 0]))),
+            )
+            waypoint_stats["waypoint_max_abs_y"] = max(
+                waypoint_stats["waypoint_max_abs_y"],
+                float(np.max(np.abs(future_waypoints_local[:, 1]))),
+            )
+            waypoint_stats["waypoint_max_distance"] = max(
+                waypoint_stats["waypoint_max_distance"],
+                float(np.max(waypoint_distances)),
+            )
             record = build_gt_record(
                 args=args,
                 scene=scene,
@@ -323,6 +394,7 @@ def build_gt_action_chunks(args):
                 obs_curvatures=ego_curvatures[hist_slice],
                 future_velocities=ego_velocities[fut_slice],
                 future_curvatures=ego_curvatures[fut_slice],
+                future_waypoints_local=future_waypoints_local,
                 curvature_clipped=future_clipped,
             )
             is_valid, reason = validate_record(record, args.history_steps, args.future_steps)
@@ -339,6 +411,7 @@ def build_gt_action_chunks(args):
     print(f"total candidate samples: {total_candidates}")
     print(f"written records: {written}")
     print(f"motion stats: {dict(motion_stats)}")
+    print(f"waypoint stats: {waypoint_stats}")
     print(f"skipped count by reason: {dict(skipped)}")
     print(f"output path: {args.output_jsonl}")
 

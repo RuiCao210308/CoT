@@ -170,12 +170,25 @@ def check_action_chunk_jsonl(
         "shape_counts": {
             "ego_history_array": Counter(),
             "future_action_gt": Counter(),
+            "future_waypoints_local": Counter(),
             "qwen_predicted_action": Counter(),
         },
         "nonfinite": {
             "ego_history_array": 0,
             "future_action_gt": 0,
+            "future_waypoints_local": 0,
             "qwen_predicted_action": 0,
+        },
+        "waypoints": {
+            "present": 0,
+            "missing": 0,
+            "schema_valid": 0,
+            "schema_invalid": 0,
+        },
+        "waypoint_stats_local": {
+            "x_m_local": [],
+            "y_m_local": [],
+            "distance_m": [],
         },
         "prompt": {
             "present": 0,
@@ -189,6 +202,9 @@ def check_action_chunk_jsonl(
             "prediction_curvature_abs_gt_warn": 0,
             "extreme_target_curvature_abs_gt": 0,
             "extreme_prediction_curvature_abs_gt": 0,
+            "waypoint_abs_x_gt_100m": 0,
+            "waypoint_abs_y_gt_50m": 0,
+            "waypoint_distance_gt_100m": 0,
         },
         "curvature_stats_1pm": {
             "target": [],
@@ -241,6 +257,7 @@ def check_action_chunk_jsonl(
         ego = record.get("input", {}).get("ego_history_array")
         input_section = record.get("input", {})
         target = record.get("target", {}).get("future_action_gt")
+        waypoints = record.get("target", {}).get("future_waypoints_local")
         pred = record.get("prediction", {}).get("qwen_predicted_action")
 
         planning_prompt = input_section.get("planning_prompt")
@@ -254,15 +271,36 @@ def check_action_chunk_jsonl(
 
         summary["shape_counts"]["ego_history_array"][_shape_key(_shape_of(ego))] += 1
         summary["shape_counts"]["future_action_gt"][_shape_key(_shape_of(target))] += 1
+        summary["shape_counts"]["future_waypoints_local"][_shape_key(_shape_of(waypoints))] += 1
         summary["shape_counts"]["qwen_predicted_action"][_shape_key(_shape_of(pred))] += 1
 
         ego_arr = _array_or_none(ego)
         target_arr = _array_or_none(target)
+        waypoint_arr = _array_or_none(waypoints)
         pred_arr = _array_or_none(pred)
 
         summary["nonfinite"]["ego_history_array"] += _count_nonfinite(ego_arr)
         summary["nonfinite"]["future_action_gt"] += _count_nonfinite(target_arr)
+        summary["nonfinite"]["future_waypoints_local"] += _count_nonfinite(waypoint_arr)
         summary["nonfinite"]["qwen_predicted_action"] += _count_nonfinite(pred_arr)
+
+        waypoint_schema = record.get("target", {}).get("future_waypoints_schema")
+        if waypoints is None:
+            summary["waypoints"]["missing"] += 1
+        else:
+            summary["waypoints"]["present"] += 1
+            if waypoint_schema == ["x_m_local", "y_m_local"]:
+                summary["waypoints"]["schema_valid"] += 1
+            else:
+                summary["waypoints"]["schema_invalid"] += 1
+                if len(summary["examples"]) < max_examples:
+                    summary["examples"].append(
+                        {
+                            **record_id,
+                            "kind": "invalid_waypoint_schema",
+                            "schema": waypoint_schema,
+                        }
+                    )
 
         if target_arr is not None:
             if target_arr.shape != (expected_future_len, 2) and len(summary["examples"]) < max_examples:
@@ -283,6 +321,32 @@ def check_action_chunk_jsonl(
                 target_arr[:, 1], curvature_extreme_abs_1pm
             )
             summary["curvature_stats_1pm"]["target"].extend(np.abs(target_arr[:, 1]).tolist())
+
+        if waypoint_arr is not None:
+            if waypoint_arr.shape != (expected_future_len, 2) and len(summary["examples"]) < max_examples:
+                summary["examples"].append(
+                    {
+                        **record_id,
+                        "kind": "unexpected_waypoint_shape",
+                        "shape": list(waypoint_arr.shape),
+                    }
+                )
+            if waypoint_arr.shape[1:] == (2,):
+                finite_rows = waypoint_arr[np.isfinite(waypoint_arr).all(axis=1)]
+                if finite_rows.size:
+                    distance = np.linalg.norm(finite_rows, axis=1)
+                    summary["waypoint_stats_local"]["x_m_local"].extend(finite_rows[:, 0].tolist())
+                    summary["waypoint_stats_local"]["y_m_local"].extend(finite_rows[:, 1].tolist())
+                    summary["waypoint_stats_local"]["distance_m"].extend(distance.tolist())
+                    summary["range_violations"]["waypoint_abs_x_gt_100m"] += int(
+                        np.count_nonzero(np.abs(finite_rows[:, 0]) > 100.0)
+                    )
+                    summary["range_violations"]["waypoint_abs_y_gt_50m"] += int(
+                        np.count_nonzero(np.abs(finite_rows[:, 1]) > 50.0)
+                    )
+                    summary["range_violations"]["waypoint_distance_gt_100m"] += int(
+                        np.count_nonzero(distance > 100.0)
+                    )
 
         if pred_arr is not None:
             if pred_arr.shape != (expected_future_len, 2) and len(summary["examples"]) < max_examples:
@@ -344,10 +408,21 @@ def finalize_action_chunk_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     records = summary["records"]
     for key, counter in list(summary["shape_counts"].items()):
         summary["shape_counts"][key] = dict(counter)
+    summary["waypoint_shapes"] = summary["shape_counts"]["future_waypoints_local"]
+    summary["waypoint_nonfinite"] = summary["nonfinite"]["future_waypoints_local"]
+    summary["waypoint_range_violations"] = {
+        "abs_x_gt_100m": summary["range_violations"]["waypoint_abs_x_gt_100m"],
+        "abs_y_gt_50m": summary["range_violations"]["waypoint_abs_y_gt_50m"],
+        "distance_gt_100m": summary["range_violations"]["waypoint_distance_gt_100m"],
+    }
     summary["prompt"]["prompt_type_counts"] = dict(summary["prompt"]["prompt_type_counts"])
     summary["curvature_stats_1pm"] = {
         key: numeric_stats(values)
         for key, values in summary["curvature_stats_1pm"].items()
+    }
+    summary["waypoint_stats_local"] = {
+        key: numeric_stats(values)
+        for key, values in summary["waypoint_stats_local"].items()
     }
 
     guard = summary["planner_guard"]
@@ -369,10 +444,11 @@ def finalize_action_chunk_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
 
     range_issues = sum(summary["range_violations"].values())
     nonfinite_issues = sum(summary["nonfinite"].values())
+    waypoint_warn = summary["waypoints"]["missing"] or summary["waypoints"]["schema_invalid"]
     summary["status"] = "pass"
     if summary["json_errors"] or summary["validation_errors"] or nonfinite_issues:
         summary["status"] = "fail"
-    elif range_issues:
+    elif range_issues or waypoint_warn:
         summary["status"] = "warn"
     return summary
 
@@ -391,7 +467,10 @@ def format_action_chunk_summary(summary: Dict[str, Any]) -> str:
         f"  curvature_stats_1pm: {summary['curvature_stats_1pm']}",
         f"  shapes.ego_history_array: {summary['shape_counts']['ego_history_array']}",
         f"  shapes.future_action_gt: {summary['shape_counts']['future_action_gt']}",
+        f"  shapes.future_waypoints_local: {summary['shape_counts']['future_waypoints_local']}",
         f"  shapes.qwen_predicted_action: {summary['shape_counts']['qwen_predicted_action']}",
+        f"  waypoints: {summary['waypoints']}",
+        f"  waypoint_stats_local: {summary['waypoint_stats_local']}",
         f"  prompt: present={summary['prompt']['present']}, missing={summary['prompt']['missing']}, "
         f"prompt_type_counts={summary['prompt']['prompt_type_counts']}",
         f"  nonfinite: {summary['nonfinite']}",

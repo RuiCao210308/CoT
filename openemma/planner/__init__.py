@@ -38,6 +38,12 @@ from .action_head import (
     denormalize_action_chunk,
     normalize_action_chunk,
 )
+from .waypoint_metrics import (
+    waypoint_ade,
+    waypoint_fde,
+    waypoint_l1_loss,
+    waypoint_longitudinal_lateral_mae,
+)
 
 __all__ = [
     "PlannerInput",
@@ -72,4 +78,8 @@ __all__ = [
     "build_fusion_action_head",
     "denormalize_action_chunk",
     "normalize_action_chunk",
+    "waypoint_ade",
+    "waypoint_fde",
+    "waypoint_l1_loss",
+    "waypoint_longitudinal_lateral_mae",
 ]
