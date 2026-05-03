@@ -101,7 +101,7 @@ def collect_samples(records: List[Dict[str, Any]], dataroot: str, max_samples: i
     samples = []
     skipped = Counter()
     for record in records:
-        if len(samples) >= max_samples:
+        if max_samples > 0 and len(samples) >= max_samples:
             break
         target = make_train_target(record)
         if target is None:
@@ -174,6 +174,10 @@ def train(args):
     accum_count = 0
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(args.epochs):
+        epoch_loss = 0.0
+        epoch_speed_l1 = 0.0
+        epoch_curvature_l1 = 0.0
+        epoch_samples = 0
         for sample in samples:
             inputs = build_qwen_inputs(
                 prompt=sample["planning_prompt"],
@@ -195,6 +199,10 @@ def train(args):
 
             speed_l1 = torch.mean(torch.abs(pred[..., 0] - target[..., 0])).detach()
             curvature_l1 = torch.mean(torch.abs(pred[..., 1] - target[..., 1])).detach()
+            epoch_loss += float(loss.detach())
+            epoch_speed_l1 += float(speed_l1)
+            epoch_curvature_l1 += float(curvature_l1)
+            epoch_samples += 1
 
             if accum_count >= args.batch_size:
                 optimizer.step()
@@ -206,6 +214,12 @@ def train(args):
                         f"step={global_step} loss={float(loss.detach()):.6f} "
                         f"speed_l1={float(speed_l1):.6f} curvature_l1={float(curvature_l1):.6f}"
                     )
+        if epoch_samples > 0:
+            print(
+                f"epoch={epoch + 1} avg_loss={epoch_loss / epoch_samples:.6f} "
+                f"avg_speed_l1={epoch_speed_l1 / epoch_samples:.6f} "
+                f"avg_curvature_l1={epoch_curvature_l1 / epoch_samples:.6f}"
+            )
 
     if accum_count > 0:
         optimizer.step()
