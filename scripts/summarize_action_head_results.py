@@ -14,6 +14,10 @@ RESULT_COLUMNS = [
     "curvature_mae_x100",
     "curvature_mae_1pm",
     "overall_l1_train_scale",
+    "waypoint_ade",
+    "waypoint_fde",
+    "waypoint_x_mae",
+    "waypoint_y_mae",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -33,6 +37,8 @@ def parse_args():
     parser.add_argument("--qwen_train_json", type=str, default="/root/autodl-tmp/eval_qwen_train.json")
     parser.add_argument("--fusion_train_json", type=str, default="/root/autodl-tmp/eval_fusion_train.json")
     parser.add_argument("--fusion_heldout_json", type=str, default="/root/autodl-tmp/eval_fusion_heldout.json")
+    parser.add_argument("--waypoint_aux_train_json", type=str, default=None)
+    parser.add_argument("--waypoint_aux_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -59,6 +65,10 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "curvature_mae_x100": data.get("curvature_mae_x100"),
         "curvature_mae_1pm": data.get("curvature_mae_1pm"),
         "overall_l1_train_scale": data.get("overall_l1_train_scale"),
+        "waypoint_ade": data.get("waypoint_ade"),
+        "waypoint_fde": data.get("waypoint_fde"),
+        "waypoint_x_mae": data.get("waypoint_x_mae"),
+        "waypoint_y_mae": data.get("waypoint_y_mae"),
     }
 
 
@@ -271,6 +281,24 @@ def main():
         ("fusion", "train", args.fusion_train_json, "fusion train"),
         ("fusion", "held-out", args.fusion_heldout_json, "fusion held-out"),
     ]
+    if args.waypoint_aux_train_json:
+        entries.append(
+            (
+                "waypoint-aux-fusion",
+                "train",
+                args.waypoint_aux_train_json,
+                "waypoint aux train",
+            )
+        )
+    if args.waypoint_aux_heldout_json:
+        entries.append(
+            (
+                "waypoint-aux-fusion",
+                "held-out",
+                args.waypoint_aux_heldout_json,
+                "waypoint aux held-out",
+            )
+        )
 
     rows = []
     for model, split, path, label in entries:
