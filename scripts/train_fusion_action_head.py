@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=100, help="0 means no limit.")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--speed_weight", type=float, default=1.0)
+    parser.add_argument("--curvature_weight", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -184,6 +186,10 @@ def train(args):
     print(f"[FusionHeadTrain] source_action_schema={SOURCE_ACTION_SCHEMA}")
     print(f"[FusionHeadTrain] train_action_schema={TRAIN_ACTION_SCHEMA}")
     print("[FusionHeadTrain] target_train[..., 1] = future_action_gt[..., 1] * 100.0")
+    print(
+        f"[FusionHeadTrain] loss_weights speed_weight={args.speed_weight} "
+        f"curvature_weight={args.curvature_weight}"
+    )
     if not samples:
         print("[FusionHeadTrain] no usable samples")
         return 1
@@ -228,7 +234,12 @@ def train(args):
             target = sample["target"].to(device=device, dtype=planning_hidden.dtype)
 
             pred = fusion_head(planning_hidden, ego_history)
-            loss = action_chunk_l1_loss(pred, target)
+            loss = action_chunk_l1_loss(
+                pred,
+                target,
+                speed_weight=args.speed_weight,
+                curvature_weight=args.curvature_weight,
+            )
             speed_l1 = torch.mean(torch.abs(pred[..., 0] - target[..., 0])).detach()
             curvature_l1 = torch.mean(torch.abs(pred[..., 1] - target[..., 1])).detach()
 
@@ -278,6 +289,8 @@ def train(args):
             "lr": args.lr,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
+            "speed_weight": args.speed_weight,
+            "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
         },
         "source_action_schema": SOURCE_ACTION_SCHEMA,
