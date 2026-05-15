@@ -7,6 +7,7 @@ from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +23,7 @@ from action_head import (
     EgoOnlyActionHead,
     FusionActionHead,
     OracleGeometryFusionHead,
+    PredictedGeometryFusionHead,
     WaypointAuxFusionHead,
 )
 from geometry_token import (
@@ -53,6 +55,7 @@ MODEL_TYPES = (
     "waypoint_aux_fusion",
     "waypoint_consistency_fusion",
     "oracle_geometry_fusion",
+    "predicted_geometry_fusion",
 )
 
 
@@ -188,6 +191,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "waypoint_aux_fusion",
             "waypoint_consistency_fusion",
             "oracle_geometry_fusion",
+            "predicted_geometry_fusion",
         ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
@@ -202,6 +206,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "waypoint_aux_fusion",
             "waypoint_consistency_fusion",
             "oracle_geometry_fusion",
+            "predicted_geometry_fusion",
         ):
             prompt_fields = get_prompt_fields(record)
             if prompt_fields is None:
@@ -221,6 +226,12 @@ def collect_samples(records: List[Dict[str, Any]], args):
                 continue
             sample["target_waypoints"] = target_waypoints
         elif args.model_type == "oracle_geometry_fusion":
+            target_waypoints = make_waypoint_target(record)
+            if target_waypoints is None:
+                skipped["invalid_target_future_waypoints_local"] += 1
+                continue
+            sample["target_waypoints"] = target_waypoints
+        elif args.model_type == "predicted_geometry_fusion":
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -368,6 +379,32 @@ def load_oracle_geometry_fusion_head(
     return head
 
 
+def load_predicted_geometry_fusion_head(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> PredictedGeometryFusionHead:
+    config = checkpoint.get("config", {})
+    head = PredictedGeometryFusionHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        geometry_descriptor_dim=int(config.get("geometry_descriptor_dim", 16)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        geometry_embed_dim=int(config.get("geometry_embed_dim", 128)),
+        fusion_hidden_size=int(config.get("fusion_hidden_size", 1024)),
+        chunk_size=int(config.get("chunk_size", 10)),
+        action_dim=int(config.get("action_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    state_dict = checkpoint.get("predicted_geometry_fusion_head_state_dict") or checkpoint.get("state_dict")
+    if state_dict is None:
+        raise KeyError("checkpoint missing predicted_geometry_fusion_head_state_dict")
+    head.load_state_dict(state_dict)
+    head.eval()
+    return head
+
+
 def resolve_consistency_dt(args, checkpoint: Dict[str, Any]) -> float:
     if args.dt is not None:
         return float(args.dt)
@@ -510,6 +547,7 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "oracle_geometry_from_gt_waypoints": sums.get("oracle_geometry_from_gt_waypoints"),
         "purpose": sums.get("oracle_geometry_purpose"),
         "geometry_descriptor_dim": sums.get("geometry_descriptor_dim"),
+        "geometry_descriptor_l1": None,
     }
     if num_points == 0:
         return metrics
@@ -537,6 +575,9 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         metrics["derived_curvature_mae_x100_vs_pred"] = (
             sums["derived_curvature_abs_x100_vs_pred"] / consistency_points
         )
+    geometry_descriptor_values = int(sums["geometry_descriptor_values"])
+    if geometry_descriptor_values > 0:
+        metrics["geometry_descriptor_l1"] = sums["geometry_descriptor_l1_sum"] / geometry_descriptor_values
     return metrics
 
 
@@ -567,6 +608,8 @@ def print_summary(metrics: Dict[str, Any]):
         print(f"purpose={metrics['purpose']}")
         print(f"geometry_descriptor_dim={metrics['geometry_descriptor_dim']}")
         print(f"dt={metrics['dt']}")
+    if metrics.get("geometry_descriptor_l1") is not None:
+        print(f"geometry_descriptor_l1={metrics['geometry_descriptor_l1']}")
 
 
 def save_report(metrics: Dict[str, Any], output_json: Optional[str]):
@@ -767,6 +810,45 @@ def evaluate_oracle_geometry_fusion(args, samples: List[Dict[str, Any]], device:
     return sums
 
 
+def evaluate_predicted_geometry_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    head = load_predicted_geometry_fusion_head(checkpoint, device)
+    config = checkpoint.get("config", {})
+    dt = resolve_checkpoint_dt(args, checkpoint)
+    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    sums = Counter()
+    sums["geometry_descriptor_dim"] = int(config.get("geometry_descriptor_dim", 16))
+    sums["consistency_dt"] = float(dt)
+    with torch.no_grad():
+        for sample in samples:
+            inputs = build_qwen_inputs(
+                prompt=sample["planning_prompt"],
+                images=sample["image_path"],
+                processor=processor,
+                model=qwen_model,
+                args=args,
+                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+            )
+            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            target_waypoints = sample["target_waypoints"].to(device=device, dtype=planning_hidden.dtype)
+            target_geometry = build_oracle_geometry_descriptor_from_waypoints(
+                target_waypoints,
+                dt=dt,
+            ).to(device=device, dtype=planning_hidden.dtype)
+            outputs = head(planning_hidden, ego_history)
+            pred_train = outputs["action_chunk"]
+            pred_geometry = outputs["geometry_descriptor"]
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            update_metric_sums(sums, pred_train, target_train)
+            geometry_l1 = F.l1_loss(pred_geometry, target_geometry, reduction="sum")
+            sums["geometry_descriptor_l1_sum"] += float(geometry_l1.detach().float().cpu())
+            sums["geometry_descriptor_values"] += int(pred_geometry.numel())
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -797,8 +879,10 @@ def main():
         sums = evaluate_waypoint_aux_fusion(args, samples, device)
     elif args.model_type == "waypoint_consistency_fusion":
         sums = evaluate_waypoint_consistency_fusion(args, samples, device)
-    else:
+    elif args.model_type == "oracle_geometry_fusion":
         sums = evaluate_oracle_geometry_fusion(args, samples, device)
+    else:
+        sums = evaluate_predicted_geometry_fusion(args, samples, device)
 
     metrics = finalize_metrics(args, len(records), skipped, sums)
     print_summary(metrics)

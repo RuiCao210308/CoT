@@ -24,6 +24,7 @@ RESULT_COLUMNS = [
     "oracle_geometry_from_gt_waypoints",
     "purpose",
     "geometry_descriptor_dim",
+    "geometry_descriptor_l1",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -49,6 +50,8 @@ def parse_args():
     parser.add_argument("--waypoint_consistency_heldout_json", type=str, default=None)
     parser.add_argument("--oracle_geometry_train_json", type=str, default=None)
     parser.add_argument("--oracle_geometry_heldout_json", type=str, default=None)
+    parser.add_argument("--predicted_geometry_train_json", type=str, default=None)
+    parser.add_argument("--predicted_geometry_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -85,6 +88,7 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "oracle_geometry_from_gt_waypoints": data.get("oracle_geometry_from_gt_waypoints"),
         "purpose": data.get("purpose"),
         "geometry_descriptor_dim": data.get("geometry_descriptor_dim"),
+        "geometry_descriptor_l1": data.get("geometry_descriptor_l1"),
     }
 
 
@@ -349,6 +353,24 @@ def main():
                 "held-out",
                 args.oracle_geometry_heldout_json,
                 "oracle geometry held-out",
+            )
+        )
+    if args.predicted_geometry_train_json:
+        entries.append(
+            (
+                "predicted-geometry-fusion",
+                "train",
+                args.predicted_geometry_train_json,
+                "predicted geometry train",
+            )
+        )
+    if args.predicted_geometry_heldout_json:
+        entries.append(
+            (
+                "predicted-geometry-fusion",
+                "held-out",
+                args.predicted_geometry_heldout_json,
+                "predicted geometry held-out",
             )
         )
 

@@ -4,6 +4,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+try:
+    from .geometry_predictor import GeometryPredictor
+except ImportError:
+    from geometry_predictor import GeometryPredictor
+
 
 class ContinuousActionHead(nn.Module):
     """Lightweight MLP head for OFT-style parallel action chunk regression."""
@@ -446,6 +451,107 @@ class OracleGeometryFusionHead(nn.Module):
         return actions.view(-1, self.chunk_size, self.action_dim)
 
 
+class PredictedGeometryFusionHead(nn.Module):
+    """Predict a geometry descriptor, then fuse it with Qwen and ego features for action chunks."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        history_steps: int = 10,
+        ego_dim: int = 3,
+        geometry_descriptor_dim: int = 16,
+        qwen_embed_dim: int = 512,
+        ego_embed_dim: int = 256,
+        geometry_embed_dim: int = 128,
+        fusion_hidden_size: int = 1024,
+        chunk_size: int = 10,
+        action_dim: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.history_steps = history_steps
+        self.ego_dim = ego_dim
+        self.geometry_descriptor_dim = geometry_descriptor_dim
+        self.qwen_embed_dim = qwen_embed_dim
+        self.ego_embed_dim = ego_embed_dim
+        self.geometry_embed_dim = geometry_embed_dim
+        self.fusion_hidden_size = fusion_hidden_size
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+
+        self.geometry_predictor = GeometryPredictor(
+            qwen_hidden_dim=qwen_hidden_dim,
+            history_steps=history_steps,
+            ego_dim=ego_dim,
+            qwen_embed_dim=512,
+            ego_embed_dim=128,
+            fusion_hidden_size=512,
+            geometry_descriptor_dim=geometry_descriptor_dim,
+        )
+
+        ego_input_dim = history_steps * ego_dim
+        self.qwen_projection = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, qwen_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.ego_encoder = nn.Sequential(
+            nn.LayerNorm(ego_input_dim),
+            nn.Linear(ego_input_dim, ego_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.geometry_encoder = nn.Sequential(
+            nn.LayerNorm(geometry_descriptor_dim),
+            nn.Linear(geometry_descriptor_dim, geometry_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(qwen_embed_dim + ego_embed_dim + geometry_embed_dim, fusion_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_hidden_size, chunk_size * action_dim),
+        )
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, "
+                f"got {planning_hidden.shape[-1]}."
+            )
+        if ego_history_array.ndim != 3:
+            raise ValueError("ego_history_array must have shape [B, history_steps, ego_dim].")
+        expected_ego = (self.history_steps, self.ego_dim)
+        if tuple(ego_history_array.shape[1:]) != expected_ego:
+            raise ValueError(
+                f"ego_history_array trailing shape must be {expected_ego}, "
+                f"got {tuple(ego_history_array.shape[1:])}."
+            )
+        if planning_hidden.shape[0] != ego_history_array.shape[0]:
+            raise ValueError("planning_hidden and ego_history_array must have the same batch size.")
+
+        geometry_descriptor = self.geometry_predictor(planning_hidden, ego_history_array)
+        qwen_embed = self.qwen_projection(planning_hidden)
+        ego_flat = ego_history_array.reshape(ego_history_array.shape[0], -1)
+        ego_embed = self.ego_encoder(ego_flat)
+        geometry_embed = self.geometry_encoder(geometry_descriptor)
+        fused = torch.cat([qwen_embed, ego_embed, geometry_embed], dim=-1)
+        action_chunk = self.fusion(fused).view(-1, self.chunk_size, self.action_dim)
+        return {
+            "action_chunk": action_chunk,
+            "geometry_descriptor": geometry_descriptor,
+        }
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
@@ -554,6 +660,34 @@ def build_oracle_geometry_fusion_head(
     dropout: float = 0.1,
 ) -> OracleGeometryFusionHead:
     return OracleGeometryFusionHead(
+        qwen_hidden_dim=qwen_hidden_dim,
+        history_steps=history_steps,
+        ego_dim=ego_dim,
+        geometry_descriptor_dim=geometry_descriptor_dim,
+        qwen_embed_dim=qwen_embed_dim,
+        ego_embed_dim=ego_embed_dim,
+        geometry_embed_dim=geometry_embed_dim,
+        fusion_hidden_size=fusion_hidden_size,
+        chunk_size=chunk_size,
+        action_dim=action_dim,
+        dropout=dropout,
+    )
+
+
+def build_predicted_geometry_fusion_head(
+    qwen_hidden_dim: int = 3584,
+    history_steps: int = 10,
+    ego_dim: int = 3,
+    geometry_descriptor_dim: int = 16,
+    qwen_embed_dim: int = 512,
+    ego_embed_dim: int = 256,
+    geometry_embed_dim: int = 128,
+    fusion_hidden_size: int = 1024,
+    chunk_size: int = 10,
+    action_dim: int = 2,
+    dropout: float = 0.1,
+) -> PredictedGeometryFusionHead:
+    return PredictedGeometryFusionHead(
         qwen_hidden_dim=qwen_hidden_dim,
         history_steps=history_steps,
         ego_dim=ego_dim,
