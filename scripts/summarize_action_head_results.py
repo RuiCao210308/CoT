@@ -21,6 +21,9 @@ RESULT_COLUMNS = [
     "consistency_l1_train_scale",
     "derived_speed_mae_vs_pred_mps",
     "derived_curvature_mae_x100_vs_pred",
+    "oracle_geometry_from_gt_waypoints",
+    "purpose",
+    "geometry_descriptor_dim",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -44,6 +47,8 @@ def parse_args():
     parser.add_argument("--waypoint_aux_heldout_json", type=str, default=None)
     parser.add_argument("--waypoint_consistency_train_json", type=str, default=None)
     parser.add_argument("--waypoint_consistency_heldout_json", type=str, default=None)
+    parser.add_argument("--oracle_geometry_train_json", type=str, default=None)
+    parser.add_argument("--oracle_geometry_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -77,6 +82,9 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "consistency_l1_train_scale": data.get("consistency_l1_train_scale"),
         "derived_speed_mae_vs_pred_mps": data.get("derived_speed_mae_vs_pred_mps"),
         "derived_curvature_mae_x100_vs_pred": data.get("derived_curvature_mae_x100_vs_pred"),
+        "oracle_geometry_from_gt_waypoints": data.get("oracle_geometry_from_gt_waypoints"),
+        "purpose": data.get("purpose"),
+        "geometry_descriptor_dim": data.get("geometry_descriptor_dim"),
     }
 
 
@@ -323,6 +331,24 @@ def main():
                 "held-out",
                 args.waypoint_consistency_heldout_json,
                 "waypoint consistency held-out",
+            )
+        )
+    if args.oracle_geometry_train_json:
+        entries.append(
+            (
+                "oracle-geometry-fusion",
+                "train",
+                args.oracle_geometry_train_json,
+                "oracle geometry train",
+            )
+        )
+    if args.oracle_geometry_heldout_json:
+        entries.append(
+            (
+                "oracle-geometry-fusion",
+                "held-out",
+                args.oracle_geometry_heldout_json,
+                "oracle geometry held-out",
             )
         )
 
