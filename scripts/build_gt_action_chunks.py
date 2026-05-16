@@ -36,6 +36,13 @@ def parse_args():
     parser.add_argument("--future_steps", type=int, default=10)
     parser.add_argument("--camera", type=str, default="CAM_FRONT")
     parser.add_argument("--max_samples", type=int, default=0, help="0 means no limit.")
+    parser.add_argument("--max_scenes", type=int, default=0, help="0 means no scene limit.")
+    parser.add_argument(
+        "--require_camera_file",
+        type=lambda x: str(x).lower() == "true",
+        default=True,
+        help="If true, skip samples whose camera file is missing under dataroot.",
+    )
     parser.add_argument("--method", type=str, default="gt")
     parser.add_argument("--model_path", type=str, default="qwen")
     parser.add_argument("--max_abs_curvature_1pm", type=float, default=0.2)
@@ -261,9 +268,9 @@ def build_gt_record(
     }
 
 
-def validate_record(record: Dict[str, Any], history_steps: int, future_steps: int):
+def validate_record(record: Dict[str, Any], history_steps: int, future_steps: int, require_image_path: bool = True):
     image_path = record.get("metadata", {}).get("image_path")
-    if not image_path or not os.path.exists(image_path):
+    if require_image_path and (not image_path or not os.path.exists(image_path)):
         return False, "missing_image_path"
 
     ego_history = np.asarray(record.get("input", {}).get("ego_history_array"), dtype=np.float32)
@@ -311,8 +318,12 @@ def build_gt_action_chunks(args):
     }
     total_candidates = 0
     written = 0
+    processed_scenes = 0
 
-    for scene_index, scene in enumerate(nusc.scene):
+    scenes_to_process = nusc.scene[: args.max_scenes] if args.max_scenes > 0 else nusc.scene
+
+    for scene_index, scene in enumerate(scenes_to_process):
+        processed_scenes += 1
         try:
             sample_tokens, sample_timestamps, image_paths, ego_poses = collect_scene_samples(
                 nusc,
@@ -344,6 +355,10 @@ def build_gt_action_chunks(args):
             if args.max_samples > 0 and written >= args.max_samples:
                 break
             total_candidates += 1
+            camera_file_exists = os.path.exists(image_paths[current_idx])
+            if args.require_camera_file and not camera_file_exists:
+                skipped["missing_camera_file"] += 1
+                continue
 
             hist_slice = slice(current_idx - args.history_steps + 1, current_idx + 1)
             fut_slice = slice(current_idx + 1, current_idx + 1 + args.future_steps)
@@ -397,7 +412,12 @@ def build_gt_action_chunks(args):
                 future_waypoints_local=future_waypoints_local,
                 curvature_clipped=future_clipped,
             )
-            is_valid, reason = validate_record(record, args.history_steps, args.future_steps)
+            is_valid, reason = validate_record(
+                record,
+                args.history_steps,
+                args.future_steps,
+                require_image_path=args.require_camera_file,
+            )
             if not is_valid:
                 skipped[reason] += 1
                 continue
@@ -407,7 +427,11 @@ def build_gt_action_chunks(args):
         if args.max_samples > 0 and written >= args.max_samples:
             break
 
+    print(f"dataroot: {args.dataroot}")
+    print(f"version: {args.version}")
+    print(f"camera: {args.camera}")
     print(f"total scenes: {len(nusc.scene)}")
+    print(f"processed scenes: {processed_scenes}")
     print(f"total candidate samples: {total_candidates}")
     print(f"written records: {written}")
     print(f"motion stats: {dict(motion_stats)}")
