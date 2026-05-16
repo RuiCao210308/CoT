@@ -25,6 +25,11 @@ RESULT_COLUMNS = [
     "purpose",
     "geometry_descriptor_dim",
     "geometry_descriptor_l1",
+    "geometry_sequence_l1",
+    "geometry_sequence_ade",
+    "geometry_sequence_fde",
+    "geometry_sequence_x_mae",
+    "geometry_sequence_y_mae",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -52,6 +57,8 @@ def parse_args():
     parser.add_argument("--oracle_geometry_heldout_json", type=str, default=None)
     parser.add_argument("--predicted_geometry_train_json", type=str, default=None)
     parser.add_argument("--predicted_geometry_heldout_json", type=str, default=None)
+    parser.add_argument("--predicted_geometry_sequence_train_json", type=str, default=None)
+    parser.add_argument("--predicted_geometry_sequence_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -89,6 +96,11 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "purpose": data.get("purpose"),
         "geometry_descriptor_dim": data.get("geometry_descriptor_dim"),
         "geometry_descriptor_l1": data.get("geometry_descriptor_l1"),
+        "geometry_sequence_l1": data.get("geometry_sequence_l1"),
+        "geometry_sequence_ade": data.get("geometry_sequence_ade"),
+        "geometry_sequence_fde": data.get("geometry_sequence_fde"),
+        "geometry_sequence_x_mae": data.get("geometry_sequence_x_mae"),
+        "geometry_sequence_y_mae": data.get("geometry_sequence_y_mae"),
     }
 
 
@@ -371,6 +383,24 @@ def main():
                 "held-out",
                 args.predicted_geometry_heldout_json,
                 "predicted geometry held-out",
+            )
+        )
+    if args.predicted_geometry_sequence_train_json:
+        entries.append(
+            (
+                "predicted-geometry-sequence-fusion",
+                "train",
+                args.predicted_geometry_sequence_train_json,
+                "predicted geometry sequence train",
+            )
+        )
+    if args.predicted_geometry_sequence_heldout_json:
+        entries.append(
+            (
+                "predicted-geometry-sequence-fusion",
+                "held-out",
+                args.predicted_geometry_sequence_heldout_json,
+                "predicted geometry sequence held-out",
             )
         )
 

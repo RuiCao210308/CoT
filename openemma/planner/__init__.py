@@ -33,6 +33,7 @@ from .action_head import (
     FusionActionHead,
     OracleGeometryFusionHead,
     PredictedGeometryFusionHead,
+    PredictedGeometrySequenceFusionHead,
     WaypointAuxFusionHead,
     action_chunk_l1_loss,
     build_continuous_action_head,
@@ -40,6 +41,7 @@ from .action_head import (
     build_fusion_action_head,
     build_oracle_geometry_fusion_head,
     build_predicted_geometry_fusion_head,
+    build_predicted_geometry_sequence_fusion_head,
     build_waypoint_aux_fusion_head,
     denormalize_action_chunk,
     normalize_action_chunk,
@@ -50,6 +52,11 @@ from .geometry_token import (
     build_oracle_geometry_descriptor_from_waypoints,
 )
 from .geometry_predictor import GeometryPredictor
+from .geometry_sequence_predictor import (
+    GEOMETRY_SEQUENCE_SCHEMA,
+    GeometrySequencePredictor,
+    build_geometry_sequence_predictor,
+)
 from .waypoint_metrics import (
     derive_action_from_waypoints,
     waypoint_action_consistency_loss,
@@ -88,6 +95,7 @@ __all__ = [
     "FusionActionHead",
     "OracleGeometryFusionHead",
     "PredictedGeometryFusionHead",
+    "PredictedGeometrySequenceFusionHead",
     "WaypointAuxFusionHead",
     "action_chunk_l1_loss",
     "build_continuous_action_head",
@@ -95,6 +103,7 @@ __all__ = [
     "build_fusion_action_head",
     "build_oracle_geometry_fusion_head",
     "build_predicted_geometry_fusion_head",
+    "build_predicted_geometry_sequence_fusion_head",
     "build_waypoint_aux_fusion_head",
     "denormalize_action_chunk",
     "normalize_action_chunk",
@@ -102,6 +111,9 @@ __all__ = [
     "ORACLE_GEOMETRY_PURPOSE",
     "build_oracle_geometry_descriptor_from_waypoints",
     "GeometryPredictor",
+    "GEOMETRY_SEQUENCE_SCHEMA",
+    "GeometrySequencePredictor",
+    "build_geometry_sequence_predictor",
     "derive_action_from_waypoints",
     "waypoint_action_consistency_loss",
     "waypoint_ade",

@@ -6,8 +6,10 @@ import torch.nn.functional as F
 
 try:
     from .geometry_predictor import GeometryPredictor
+    from .geometry_sequence_predictor import GeometrySequencePredictor
 except ImportError:
     from geometry_predictor import GeometryPredictor
+    from geometry_sequence_predictor import GeometrySequencePredictor
 
 
 class ContinuousActionHead(nn.Module):
@@ -552,6 +554,107 @@ class PredictedGeometryFusionHead(nn.Module):
         }
 
 
+class PredictedGeometrySequenceFusionHead(nn.Module):
+    """Fuse global Qwen/ego context with a predicted per-step geometry sequence."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        history_steps: int = 10,
+        ego_dim: int = 3,
+        qwen_embed_dim: int = 512,
+        ego_embed_dim: int = 256,
+        global_context_dim: int = 512,
+        geometry_step_embed_dim: int = 128,
+        per_step_hidden_size: int = 512,
+        chunk_size: int = 10,
+        action_dim: int = 2,
+        geometry_sequence_dim: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.history_steps = history_steps
+        self.ego_dim = ego_dim
+        self.qwen_embed_dim = qwen_embed_dim
+        self.ego_embed_dim = ego_embed_dim
+        self.global_context_dim = global_context_dim
+        self.geometry_step_embed_dim = geometry_step_embed_dim
+        self.per_step_hidden_size = per_step_hidden_size
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        self.geometry_sequence_dim = geometry_sequence_dim
+
+        ego_input_dim = history_steps * ego_dim
+        self.qwen_projection = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, qwen_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.ego_encoder = nn.Sequential(
+            nn.LayerNorm(ego_input_dim),
+            nn.Linear(ego_input_dim, ego_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.geometry_step_encoder = nn.Sequential(
+            nn.Linear(geometry_sequence_dim, geometry_step_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.global_context = nn.Sequential(
+            nn.Linear(qwen_embed_dim + ego_embed_dim, global_context_dim),
+            nn.GELU(),
+        )
+        self.per_step_fusion = nn.Sequential(
+            nn.Linear(global_context_dim + geometry_step_embed_dim, per_step_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(per_step_hidden_size, action_dim),
+        )
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+        geometry_sequence: torch.Tensor,
+    ) -> torch.Tensor:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, got {planning_hidden.shape[-1]}."
+            )
+        if ego_history_array.ndim != 3:
+            raise ValueError("ego_history_array must have shape [B, history_steps, ego_dim].")
+        expected_ego = (self.history_steps, self.ego_dim)
+        if tuple(ego_history_array.shape[1:]) != expected_ego:
+            raise ValueError(
+                f"ego_history_array trailing shape must be {expected_ego}, "
+                f"got {tuple(ego_history_array.shape[1:])}."
+            )
+        expected_geometry = (self.chunk_size, self.geometry_sequence_dim)
+        if geometry_sequence.ndim != 3 or tuple(geometry_sequence.shape[1:]) != expected_geometry:
+            raise ValueError(
+                f"geometry_sequence trailing shape must be {expected_geometry}, "
+                f"got {tuple(geometry_sequence.shape[1:])}."
+            )
+        if planning_hidden.shape[0] != ego_history_array.shape[0]:
+            raise ValueError("planning_hidden and ego_history_array must have the same batch size.")
+        if planning_hidden.shape[0] != geometry_sequence.shape[0]:
+            raise ValueError("planning_hidden and geometry_sequence must have the same batch size.")
+
+        qwen_embed = self.qwen_projection(planning_hidden)
+        ego_flat = ego_history_array.reshape(ego_history_array.shape[0], -1)
+        ego_embed = self.ego_encoder(ego_flat)
+        global_context = self.global_context(torch.cat([qwen_embed, ego_embed], dim=-1))
+        global_context = global_context.unsqueeze(1).expand(-1, self.chunk_size, -1)
+        geometry_embed = self.geometry_step_encoder(geometry_sequence)
+        fused = torch.cat([global_context, geometry_embed], dim=-1)
+        return self.per_step_fusion(fused)
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
@@ -698,6 +801,36 @@ def build_predicted_geometry_fusion_head(
         fusion_hidden_size=fusion_hidden_size,
         chunk_size=chunk_size,
         action_dim=action_dim,
+        dropout=dropout,
+    )
+
+
+def build_predicted_geometry_sequence_fusion_head(
+    qwen_hidden_dim: int = 3584,
+    history_steps: int = 10,
+    ego_dim: int = 3,
+    qwen_embed_dim: int = 512,
+    ego_embed_dim: int = 256,
+    global_context_dim: int = 512,
+    geometry_step_embed_dim: int = 128,
+    per_step_hidden_size: int = 512,
+    chunk_size: int = 10,
+    action_dim: int = 2,
+    geometry_sequence_dim: int = 2,
+    dropout: float = 0.1,
+) -> PredictedGeometrySequenceFusionHead:
+    return PredictedGeometrySequenceFusionHead(
+        qwen_hidden_dim=qwen_hidden_dim,
+        history_steps=history_steps,
+        ego_dim=ego_dim,
+        qwen_embed_dim=qwen_embed_dim,
+        ego_embed_dim=ego_embed_dim,
+        global_context_dim=global_context_dim,
+        geometry_step_embed_dim=geometry_step_embed_dim,
+        per_step_hidden_size=per_step_hidden_size,
+        chunk_size=chunk_size,
+        action_dim=action_dim,
+        geometry_sequence_dim=geometry_sequence_dim,
         dropout=dropout,
     )
 
