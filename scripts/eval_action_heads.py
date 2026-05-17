@@ -19,6 +19,7 @@ if PLANNER_DIR not in sys.path:
 
 from action_head import (
     ContinuousActionHead,
+    CurvatureOnlyDetachedResidualGeometrySequenceFusionHead,
     DecoupledEgoVLAActionHead,
     DetachedResidualGeometrySequenceFusionHead,
     EgoOnlyActionHead,
@@ -61,6 +62,7 @@ MODEL_TYPES = (
     "predicted_geometry_fusion",
     "predicted_geometry_sequence_fusion",
     "detached_residual_geometry_sequence_fusion",
+    "curvature_only_detached_residual_geometry_sequence_fusion",
 )
 
 
@@ -199,6 +201,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "predicted_geometry_fusion",
             "predicted_geometry_sequence_fusion",
             "detached_residual_geometry_sequence_fusion",
+            "curvature_only_detached_residual_geometry_sequence_fusion",
         ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
@@ -216,6 +219,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "predicted_geometry_fusion",
             "predicted_geometry_sequence_fusion",
             "detached_residual_geometry_sequence_fusion",
+            "curvature_only_detached_residual_geometry_sequence_fusion",
         ):
             prompt_fields = get_prompt_fields(record)
             if prompt_fields is None:
@@ -253,6 +257,12 @@ def collect_samples(records: List[Dict[str, Any]], args):
                 continue
             sample["target_waypoints"] = target_waypoints
         elif args.model_type == "detached_residual_geometry_sequence_fusion":
+            target_waypoints = make_waypoint_target(record)
+            if target_waypoints is None:
+                skipped["invalid_target_future_waypoints_local"] += 1
+                continue
+            sample["target_waypoints"] = target_waypoints
+        elif args.model_type == "curvature_only_detached_residual_geometry_sequence_fusion":
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -516,6 +526,52 @@ def load_detached_residual_geometry_sequence_modules(
     return {"predictor": predictor, "head": head, "config": config}
 
 
+def load_curvature_only_detached_residual_geometry_sequence_modules(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    config = checkpoint.get("config", {})
+    predictor = GeometrySequencePredictor(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        fusion_hidden_size=int(config.get("predictor_fusion_hidden_size", 1024)),
+        future_steps=int(config.get("chunk_size", 10)),
+        geometry_sequence_dim=int(config.get("geometry_sequence_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    predictor_state = checkpoint.get("geometry_sequence_predictor_state_dict")
+    if predictor_state is None:
+        raise KeyError("checkpoint missing geometry_sequence_predictor_state_dict")
+    predictor.load_state_dict(predictor_state)
+    predictor.eval()
+
+    head = CurvatureOnlyDetachedResidualGeometrySequenceFusionHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        base_hidden_size=int(config.get("base_hidden_size", 1024)),
+        global_context_dim=int(config.get("global_context_dim", 512)),
+        geometry_step_embed_dim=int(config.get("geometry_step_embed_dim", 128)),
+        residual_hidden_size=int(config.get("residual_hidden_size", 256)),
+        chunk_size=int(config.get("chunk_size", 10)),
+        action_dim=int(config.get("action_dim", 2)),
+        geometry_sequence_dim=int(config.get("geometry_sequence_dim", 2)),
+        residual_scale=float(config.get("residual_scale", 0.1)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    head_state = checkpoint.get("curvature_only_detached_residual_geometry_sequence_fusion_head_state_dict")
+    if head_state is None:
+        raise KeyError("checkpoint missing curvature_only_detached_residual_geometry_sequence_fusion_head_state_dict")
+    head.load_state_dict(head_state)
+    head.eval()
+    return {"predictor": predictor, "head": head, "config": config}
+
+
 def resolve_consistency_dt(args, checkpoint: Dict[str, Any]) -> float:
     if args.dt is not None:
         return float(args.dt)
@@ -646,6 +702,24 @@ def update_geometry_sequence_metric_sums(
     sums["geometry_sequence_y_abs_sum"] += float(y_mae) * int(pred_sequence.shape[0] * pred_sequence.shape[1])
 
 
+def update_curvature_only_residual_metric_sums(
+    sums: Dict[str, float],
+    outputs: Dict[str, torch.Tensor],
+    target_train: torch.Tensor,
+):
+    residual_curvature = outputs["residual_curvature"].detach().float().cpu()
+    base_action = outputs["base_action"].detach().float().cpu()
+    target_train = target_train.detach().float().cpu()
+    target_physical = pred_to_physical(target_train)
+    base_physical = pred_to_physical(base_action)
+
+    sums["residual_curvature_abs_sum"] += float(torch.abs(residual_curvature).sum())
+    sums["residual_curvature_values"] += int(residual_curvature.numel())
+    sums["base_speed_abs"] += float(torch.abs(base_physical[..., 0] - target_physical[..., 0]).sum())
+    sums["base_curvature_abs_x100"] += float(torch.abs(base_action[..., 1] - target_train[..., 1]).sum())
+    sums["base_points"] += int(base_action.shape[0] * base_action.shape[1])
+
+
 def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str, float]) -> Dict[str, Any]:
     num_points = int(sums["points"])
     num_action_values = int(sums["action_values"])
@@ -692,6 +766,11 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "geometry_sequence_y_mae": None,
         "residual_scale": sums.get("residual_scale"),
         "detach_geometry_for_action": sums.get("detach_geometry_for_action"),
+        "residual_target": sums.get("residual_target"),
+        "speed_source": sums.get("speed_source"),
+        "residual_curvature_abs_mean": None,
+        "base_speed_mae_mps": None,
+        "base_curvature_mae_x100": None,
     }
     if num_points == 0:
         return metrics
@@ -731,6 +810,13 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         metrics["geometry_sequence_fde"] = sums["geometry_sequence_fde_sum"] / geometry_sequence_samples
         metrics["geometry_sequence_x_mae"] = sums["geometry_sequence_x_abs_sum"] / geometry_sequence_points
         metrics["geometry_sequence_y_mae"] = sums["geometry_sequence_y_abs_sum"] / geometry_sequence_points
+    residual_curvature_values = int(sums["residual_curvature_values"])
+    if residual_curvature_values > 0:
+        metrics["residual_curvature_abs_mean"] = sums["residual_curvature_abs_sum"] / residual_curvature_values
+    base_points = int(sums["base_points"])
+    if base_points > 0:
+        metrics["base_speed_mae_mps"] = sums["base_speed_abs"] / base_points
+        metrics["base_curvature_mae_x100"] = sums["base_curvature_abs_x100"] / base_points
     return metrics
 
 
@@ -774,6 +860,13 @@ def print_summary(metrics: Dict[str, Any]):
     if metrics.get("residual_scale") is not None:
         print(f"residual_scale={metrics['residual_scale']}")
         print(f"detach_geometry_for_action={metrics['detach_geometry_for_action']}")
+    if metrics.get("residual_target") is not None:
+        print(f"residual_target={metrics['residual_target']}")
+        print(f"speed_source={metrics['speed_source']}")
+    if metrics.get("residual_curvature_abs_mean") is not None:
+        print(f"residual_curvature_abs_mean={metrics['residual_curvature_abs_mean']}")
+        print(f"base_speed_mae_mps={metrics['base_speed_mae_mps']}")
+        print(f"base_curvature_mae_x100={metrics['base_curvature_mae_x100']}")
 
 
 def save_report(metrics: Dict[str, Any], output_json: Optional[str]):
@@ -1091,6 +1184,55 @@ def evaluate_detached_residual_geometry_sequence_fusion(
     return sums
 
 
+def evaluate_curvature_only_detached_residual_geometry_sequence_fusion(
+    args,
+    samples: List[Dict[str, Any]],
+    device: torch.device,
+):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    modules = load_curvature_only_detached_residual_geometry_sequence_modules(checkpoint, device)
+    predictor = modules["predictor"]
+    head = modules["head"]
+    config = modules["config"]
+    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    sums = Counter()
+    sums["geometry_sequence_dim"] = int(config.get("geometry_sequence_dim", 2))
+    sums["geometry_sequence_schema"] = config.get("geometry_sequence_schema", GEOMETRY_SEQUENCE_SCHEMA)
+    sums["residual_scale"] = float(config.get("residual_scale", 0.1))
+    sums["detach_geometry_for_action"] = bool(config.get("detach_geometry_for_action", True))
+    sums["residual_target"] = str(config.get("residual_target", "curvature_only"))
+    sums["speed_source"] = str(config.get("speed_source", "base_fusion_action"))
+    with torch.no_grad():
+        for sample in samples:
+            inputs = build_qwen_inputs(
+                prompt=sample["planning_prompt"],
+                images=sample["image_path"],
+                processor=processor,
+                model=qwen_model,
+                args=args,
+                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+            )
+            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            pred_geometry_sequence = predictor(planning_hidden, ego_history)
+            geometry_for_action = pred_geometry_sequence.detach()
+            outputs = head(
+                planning_hidden,
+                ego_history,
+                geometry_for_action,
+                detach_geometry=True,
+            )
+            pred_train = outputs["action_chunk"]
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            update_metric_sums(sums, pred_train, target_train)
+            update_curvature_only_residual_metric_sums(sums, outputs, target_train)
+            target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_geometry_sequence.dtype)
+            update_geometry_sequence_metric_sums(sums, pred_geometry_sequence, target_waypoints)
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -1127,8 +1269,10 @@ def main():
         sums = evaluate_predicted_geometry_fusion(args, samples, device)
     elif args.model_type == "predicted_geometry_sequence_fusion":
         sums = evaluate_predicted_geometry_sequence_fusion(args, samples, device)
-    else:
+    elif args.model_type == "detached_residual_geometry_sequence_fusion":
         sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
+    else:
+        sums = evaluate_curvature_only_detached_residual_geometry_sequence_fusion(args, samples, device)
 
     metrics = finalize_metrics(args, len(records), skipped, sums)
     print_summary(metrics)

@@ -28,6 +28,7 @@ from .qwen_planner import (
 )
 from .action_head import (
     ContinuousActionHead,
+    CurvatureOnlyDetachedResidualGeometrySequenceFusionHead,
     DecoupledEgoVLAActionHead,
     DetachedResidualGeometrySequenceFusionHead,
     EgoOnlyActionHead,
@@ -38,6 +39,7 @@ from .action_head import (
     WaypointAuxFusionHead,
     action_chunk_l1_loss,
     build_continuous_action_head,
+    build_curvature_only_detached_residual_geometry_sequence_fusion_head,
     build_decoupled_egovla_action_head,
     build_detached_residual_geometry_sequence_fusion_head,
     build_fusion_action_head,
@@ -92,6 +94,7 @@ __all__ = [
     "generate_with_qwen",
     "select_planning_hidden",
     "ContinuousActionHead",
+    "CurvatureOnlyDetachedResidualGeometrySequenceFusionHead",
     "DecoupledEgoVLAActionHead",
     "DetachedResidualGeometrySequenceFusionHead",
     "EgoOnlyActionHead",
@@ -102,6 +105,7 @@ __all__ = [
     "WaypointAuxFusionHead",
     "action_chunk_l1_loss",
     "build_continuous_action_head",
+    "build_curvature_only_detached_residual_geometry_sequence_fusion_head",
     "build_decoupled_egovla_action_head",
     "build_detached_residual_geometry_sequence_fusion_head",
     "build_fusion_action_head",
