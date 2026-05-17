@@ -30,6 +30,8 @@ RESULT_COLUMNS = [
     "geometry_sequence_fde",
     "geometry_sequence_x_mae",
     "geometry_sequence_y_mae",
+    "residual_scale",
+    "detach_geometry_for_action",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -59,6 +61,8 @@ def parse_args():
     parser.add_argument("--predicted_geometry_heldout_json", type=str, default=None)
     parser.add_argument("--predicted_geometry_sequence_train_json", type=str, default=None)
     parser.add_argument("--predicted_geometry_sequence_heldout_json", type=str, default=None)
+    parser.add_argument("--detached_residual_geometry_sequence_train_json", type=str, default=None)
+    parser.add_argument("--detached_residual_geometry_sequence_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -101,6 +105,8 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "geometry_sequence_fde": data.get("geometry_sequence_fde"),
         "geometry_sequence_x_mae": data.get("geometry_sequence_x_mae"),
         "geometry_sequence_y_mae": data.get("geometry_sequence_y_mae"),
+        "residual_scale": data.get("residual_scale"),
+        "detach_geometry_for_action": data.get("detach_geometry_for_action"),
     }
 
 
@@ -401,6 +407,24 @@ def main():
                 "held-out",
                 args.predicted_geometry_sequence_heldout_json,
                 "predicted geometry sequence held-out",
+            )
+        )
+    if args.detached_residual_geometry_sequence_train_json:
+        entries.append(
+            (
+                "detached-residual-geometry-sequence-fusion",
+                "train",
+                args.detached_residual_geometry_sequence_train_json,
+                "detached residual geometry sequence train",
+            )
+        )
+    if args.detached_residual_geometry_sequence_heldout_json:
+        entries.append(
+            (
+                "detached-residual-geometry-sequence-fusion",
+                "held-out",
+                args.detached_residual_geometry_sequence_heldout_json,
+                "detached residual geometry sequence held-out",
             )
         )
 

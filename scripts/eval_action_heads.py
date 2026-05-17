@@ -20,6 +20,7 @@ if PLANNER_DIR not in sys.path:
 from action_head import (
     ContinuousActionHead,
     DecoupledEgoVLAActionHead,
+    DetachedResidualGeometrySequenceFusionHead,
     EgoOnlyActionHead,
     FusionActionHead,
     OracleGeometryFusionHead,
@@ -59,6 +60,7 @@ MODEL_TYPES = (
     "oracle_geometry_fusion",
     "predicted_geometry_fusion",
     "predicted_geometry_sequence_fusion",
+    "detached_residual_geometry_sequence_fusion",
 )
 
 
@@ -196,6 +198,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "oracle_geometry_fusion",
             "predicted_geometry_fusion",
             "predicted_geometry_sequence_fusion",
+            "detached_residual_geometry_sequence_fusion",
         ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
@@ -212,6 +215,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "oracle_geometry_fusion",
             "predicted_geometry_fusion",
             "predicted_geometry_sequence_fusion",
+            "detached_residual_geometry_sequence_fusion",
         ):
             prompt_fields = get_prompt_fields(record)
             if prompt_fields is None:
@@ -243,6 +247,12 @@ def collect_samples(records: List[Dict[str, Any]], args):
                 continue
             sample["target_waypoints"] = target_waypoints
         elif args.model_type == "predicted_geometry_sequence_fusion":
+            target_waypoints = make_waypoint_target(record)
+            if target_waypoints is None:
+                skipped["invalid_target_future_waypoints_local"] += 1
+                continue
+            sample["target_waypoints"] = target_waypoints
+        elif args.model_type == "detached_residual_geometry_sequence_fusion":
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -460,6 +470,52 @@ def load_geometry_sequence_modules(
     return {"predictor": predictor, "head": head}
 
 
+def load_detached_residual_geometry_sequence_modules(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    config = checkpoint.get("config", {})
+    predictor = GeometrySequencePredictor(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        fusion_hidden_size=int(config.get("predictor_fusion_hidden_size", 1024)),
+        future_steps=int(config.get("chunk_size", 10)),
+        geometry_sequence_dim=int(config.get("geometry_sequence_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    predictor_state = checkpoint.get("geometry_sequence_predictor_state_dict")
+    if predictor_state is None:
+        raise KeyError("checkpoint missing geometry_sequence_predictor_state_dict")
+    predictor.load_state_dict(predictor_state)
+    predictor.eval()
+
+    head = DetachedResidualGeometrySequenceFusionHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        base_hidden_size=int(config.get("base_hidden_size", 1024)),
+        global_context_dim=int(config.get("global_context_dim", 512)),
+        geometry_step_embed_dim=int(config.get("geometry_step_embed_dim", 128)),
+        residual_hidden_size=int(config.get("residual_hidden_size", 256)),
+        chunk_size=int(config.get("chunk_size", 10)),
+        action_dim=int(config.get("action_dim", 2)),
+        geometry_sequence_dim=int(config.get("geometry_sequence_dim", 2)),
+        residual_scale=float(config.get("residual_scale", 0.1)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    head_state = checkpoint.get("detached_residual_geometry_sequence_fusion_head_state_dict")
+    if head_state is None:
+        raise KeyError("checkpoint missing detached_residual_geometry_sequence_fusion_head_state_dict")
+    head.load_state_dict(head_state)
+    head.eval()
+    return {"predictor": predictor, "head": head, "config": config}
+
+
 def resolve_consistency_dt(args, checkpoint: Dict[str, Any]) -> float:
     if args.dt is not None:
         return float(args.dt)
@@ -634,6 +690,8 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "geometry_sequence_fde": None,
         "geometry_sequence_x_mae": None,
         "geometry_sequence_y_mae": None,
+        "residual_scale": sums.get("residual_scale"),
+        "detach_geometry_for_action": sums.get("detach_geometry_for_action"),
     }
     if num_points == 0:
         return metrics
@@ -713,6 +771,9 @@ def print_summary(metrics: Dict[str, Any]):
         print(f"geometry_sequence_fde={metrics['geometry_sequence_fde']}")
         print(f"geometry_sequence_x_mae={metrics['geometry_sequence_x_mae']}")
         print(f"geometry_sequence_y_mae={metrics['geometry_sequence_y_mae']}")
+    if metrics.get("residual_scale") is not None:
+        print(f"residual_scale={metrics['residual_scale']}")
+        print(f"detach_geometry_for_action={metrics['detach_geometry_for_action']}")
 
 
 def save_report(metrics: Dict[str, Any], output_json: Optional[str]):
@@ -985,6 +1046,51 @@ def evaluate_predicted_geometry_sequence_fusion(args, samples: List[Dict[str, An
     return sums
 
 
+def evaluate_detached_residual_geometry_sequence_fusion(
+    args,
+    samples: List[Dict[str, Any]],
+    device: torch.device,
+):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    modules = load_detached_residual_geometry_sequence_modules(checkpoint, device)
+    predictor = modules["predictor"]
+    head = modules["head"]
+    config = modules["config"]
+    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    sums = Counter()
+    sums["geometry_sequence_dim"] = int(config.get("geometry_sequence_dim", 2))
+    sums["geometry_sequence_schema"] = config.get("geometry_sequence_schema", GEOMETRY_SEQUENCE_SCHEMA)
+    sums["residual_scale"] = float(config.get("residual_scale", 0.1))
+    sums["detach_geometry_for_action"] = bool(config.get("detach_geometry_for_action", True))
+    with torch.no_grad():
+        for sample in samples:
+            inputs = build_qwen_inputs(
+                prompt=sample["planning_prompt"],
+                images=sample["image_path"],
+                processor=processor,
+                model=qwen_model,
+                args=args,
+                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+            )
+            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            pred_geometry_sequence = predictor(planning_hidden, ego_history)
+            geometry_for_action = pred_geometry_sequence.detach()
+            pred_train = head(
+                planning_hidden,
+                ego_history,
+                geometry_for_action,
+                detach_geometry=True,
+            )
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            update_metric_sums(sums, pred_train, target_train)
+            target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_geometry_sequence.dtype)
+            update_geometry_sequence_metric_sums(sums, pred_geometry_sequence, target_waypoints)
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -1019,8 +1125,10 @@ def main():
         sums = evaluate_oracle_geometry_fusion(args, samples, device)
     elif args.model_type == "predicted_geometry_fusion":
         sums = evaluate_predicted_geometry_fusion(args, samples, device)
-    else:
+    elif args.model_type == "predicted_geometry_sequence_fusion":
         sums = evaluate_predicted_geometry_sequence_fusion(args, samples, device)
+    else:
+        sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
 
     metrics = finalize_metrics(args, len(records), skipped, sums)
     print_summary(metrics)
