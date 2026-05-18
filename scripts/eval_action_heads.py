@@ -77,6 +77,7 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=100, help="0 means no limit after start_index.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_json", type=str, default=None)
+    parser.add_argument("--output_jsonl", type=str, default=None)
     parser.add_argument("--dt", type=float, default=None, help="Waypoint-to-action dt; defaults to checkpoint config then 0.5.")
     parser.add_argument("--max_abs_curvature_1pm", type=float, default=0.2)
     return parser.parse_args()
@@ -187,6 +188,9 @@ def collect_samples(records: List[Dict[str, Any]], args):
         sample = {
             "record_index": record_index,
             "line_no": record.get("_line_no"),
+            "scene_name": record.get("metadata", {}).get("scene_name"),
+            "frame_idx": record.get("metadata", {}).get("frame_idx"),
+            "sample_token": record.get("metadata", {}).get("sample_token"),
             "target_train": targets["train_scale"],
             "target_physical": targets["physical"],
         }
@@ -879,6 +883,61 @@ def save_report(metrics: Dict[str, Any], output_json: Optional[str]):
     print(f"[EvalActionHead] saved report: {output_json}")
 
 
+def tensor_to_list(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return None
+    tensor = tensor.detach().float().cpu()
+    if tensor.ndim >= 1 and tensor.shape[0] == 1:
+        tensor = tensor[0]
+    return tensor.tolist()
+
+
+def write_eval_record(
+    args,
+    sample: Dict[str, Any],
+    pred_train: torch.Tensor,
+    target_train: torch.Tensor,
+    target_waypoints: Optional[torch.Tensor] = None,
+):
+    handle = getattr(args, "_output_jsonl_handle", None)
+    if handle is None:
+        return
+
+    pred_train_cpu = pred_train.detach().float().cpu()
+    target_train_cpu = target_train.detach().float().cpu()
+    pred_physical = pred_to_physical(pred_train_cpu)
+    target_physical = pred_to_physical(target_train_cpu)
+    speed_abs = torch.abs(pred_physical[..., 0] - target_physical[..., 0])
+    curvature_abs_x100 = torch.abs(pred_train_cpu[..., 1] - target_train_cpu[..., 1])
+    overall_abs = torch.abs(pred_train_cpu - target_train_cpu)
+
+    if target_waypoints is None:
+        target_waypoints = sample.get("target_waypoints")
+
+    row = {
+        "scene_name": sample.get("scene_name"),
+        "frame_idx": sample.get("frame_idx"),
+        "sample_token": sample.get("sample_token"),
+        "record_index": sample.get("record_index"),
+        "line_no": sample.get("line_no"),
+        "model_type": args.model_type,
+        "parse_success": True,
+        "pred_action": tensor_to_list(pred_train_cpu),
+        "pred_action_schema": TRAIN_ACTION_SCHEMA,
+        "target_action": tensor_to_list(target_physical),
+        "target_action_schema": SOURCE_ACTION_SCHEMA,
+        "target_action_train_scale": tensor_to_list(target_train_cpu),
+        "target_action_train_scale_schema": TRAIN_ACTION_SCHEMA,
+        "target_waypoints_local": tensor_to_list(target_waypoints),
+        "target_waypoints_schema": ["x_m_local", "y_m_local"] if target_waypoints is not None else None,
+        "speed_mae_mps": float(speed_abs.mean()),
+        "curvature_mae_x100": float(curvature_abs_x100.mean()),
+        "overall_l1_train_scale": float(overall_abs.mean()),
+    }
+    handle.write(json.dumps(row, sort_keys=True) + "\n")
+    handle.flush()
+
+
 def evaluate_ego_only(args, samples: List[Dict[str, Any]], device: torch.device):
     checkpoint = load_checkpoint(args.checkpoint, device)
     head = load_ego_head(checkpoint, device)
@@ -889,6 +948,7 @@ def evaluate_ego_only(args, samples: List[Dict[str, Any]], device: torch.device)
             pred_train = head(ego_history)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
+            write_eval_record(args, sample, pred_train, target_train)
     return sums
 
 
@@ -913,6 +973,7 @@ def evaluate_qwen_hidden(args, samples: List[Dict[str, Any]], device: torch.devi
             pred_train = action_head(planning_hidden)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
+            write_eval_record(args, sample, pred_train, target_train)
     return sums
 
 
@@ -938,6 +999,7 @@ def evaluate_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
             pred_train = fusion_head(planning_hidden, ego_history)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
+            write_eval_record(args, sample, pred_train, target_train)
     return sums
 
 
@@ -963,6 +1025,7 @@ def evaluate_decoupled_egovla(args, samples: List[Dict[str, Any]], device: torch
             pred_train = head(planning_hidden, ego_history)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
+            write_eval_record(args, sample, pred_train, target_train)
     return sums
 
 
@@ -991,6 +1054,7 @@ def evaluate_waypoint_aux_fusion(args, samples: List[Dict[str, Any]], device: to
             update_metric_sums(sums, pred_train, target_train)
             target_waypoints = sample["target_waypoints"].to(device=device, dtype=outputs["waypoints"].dtype)
             update_waypoint_metric_sums(sums, outputs["waypoints"], target_waypoints)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
     return sums
 
 
@@ -1021,6 +1085,7 @@ def evaluate_waypoint_consistency_fusion(args, samples: List[Dict[str, Any]], de
             update_metric_sums(sums, pred_train, target_train)
             target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_waypoints.dtype)
             update_waypoint_metric_sums(sums, pred_waypoints, target_waypoints)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
             update_consistency_metric_sums(
                 sums,
                 pred_train,
@@ -1064,6 +1129,7 @@ def evaluate_oracle_geometry_fusion(args, samples: List[Dict[str, Any]], device:
             pred_train = head(planning_hidden, ego_history, geometry_descriptor)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
     return sums
 
 
@@ -1100,6 +1166,7 @@ def evaluate_predicted_geometry_fusion(args, samples: List[Dict[str, Any]], devi
             pred_geometry = outputs["geometry_descriptor"]
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
             geometry_l1 = F.l1_loss(pred_geometry, target_geometry, reduction="sum")
             sums["geometry_descriptor_l1_sum"] += float(geometry_l1.detach().float().cpu())
             sums["geometry_descriptor_values"] += int(pred_geometry.numel())
@@ -1136,6 +1203,7 @@ def evaluate_predicted_geometry_sequence_fusion(args, samples: List[Dict[str, An
             update_metric_sums(sums, pred_train, target_train)
             target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_geometry_sequence.dtype)
             update_geometry_sequence_metric_sums(sums, pred_geometry_sequence, target_waypoints)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
     return sums
 
 
@@ -1181,6 +1249,7 @@ def evaluate_detached_residual_geometry_sequence_fusion(
             update_metric_sums(sums, pred_train, target_train)
             target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_geometry_sequence.dtype)
             update_geometry_sequence_metric_sums(sums, pred_geometry_sequence, target_waypoints)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
     return sums
 
 
@@ -1230,6 +1299,7 @@ def evaluate_curvature_only_detached_residual_geometry_sequence_fusion(
             update_curvature_only_residual_metric_sums(sums, outputs, target_train)
             target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_geometry_sequence.dtype)
             update_geometry_sequence_metric_sums(sums, pred_geometry_sequence, target_waypoints)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
     return sums
 
 
@@ -1251,32 +1321,44 @@ def main():
         return 1
 
     device = resolve_device(args.device)
-    if args.model_type == "ego_only":
-        sums = evaluate_ego_only(args, samples, device)
-    elif args.model_type == "qwen_hidden":
-        sums = evaluate_qwen_hidden(args, samples, device)
-    elif args.model_type == "fusion":
-        sums = evaluate_fusion(args, samples, device)
-    elif args.model_type == "decoupled_egovla":
-        sums = evaluate_decoupled_egovla(args, samples, device)
-    elif args.model_type == "waypoint_aux_fusion":
-        sums = evaluate_waypoint_aux_fusion(args, samples, device)
-    elif args.model_type == "waypoint_consistency_fusion":
-        sums = evaluate_waypoint_consistency_fusion(args, samples, device)
-    elif args.model_type == "oracle_geometry_fusion":
-        sums = evaluate_oracle_geometry_fusion(args, samples, device)
-    elif args.model_type == "predicted_geometry_fusion":
-        sums = evaluate_predicted_geometry_fusion(args, samples, device)
-    elif args.model_type == "predicted_geometry_sequence_fusion":
-        sums = evaluate_predicted_geometry_sequence_fusion(args, samples, device)
-    elif args.model_type == "detached_residual_geometry_sequence_fusion":
-        sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
-    else:
-        sums = evaluate_curvature_only_detached_residual_geometry_sequence_fusion(args, samples, device)
+    output_jsonl_handle = None
+    if args.output_jsonl:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_jsonl)), exist_ok=True)
+        output_jsonl_handle = open(args.output_jsonl, "w", encoding="utf-8")
+        args._output_jsonl_handle = output_jsonl_handle
+    try:
+        if args.model_type == "ego_only":
+            sums = evaluate_ego_only(args, samples, device)
+        elif args.model_type == "qwen_hidden":
+            sums = evaluate_qwen_hidden(args, samples, device)
+        elif args.model_type == "fusion":
+            sums = evaluate_fusion(args, samples, device)
+        elif args.model_type == "decoupled_egovla":
+            sums = evaluate_decoupled_egovla(args, samples, device)
+        elif args.model_type == "waypoint_aux_fusion":
+            sums = evaluate_waypoint_aux_fusion(args, samples, device)
+        elif args.model_type == "waypoint_consistency_fusion":
+            sums = evaluate_waypoint_consistency_fusion(args, samples, device)
+        elif args.model_type == "oracle_geometry_fusion":
+            sums = evaluate_oracle_geometry_fusion(args, samples, device)
+        elif args.model_type == "predicted_geometry_fusion":
+            sums = evaluate_predicted_geometry_fusion(args, samples, device)
+        elif args.model_type == "predicted_geometry_sequence_fusion":
+            sums = evaluate_predicted_geometry_sequence_fusion(args, samples, device)
+        elif args.model_type == "detached_residual_geometry_sequence_fusion":
+            sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
+        else:
+            sums = evaluate_curvature_only_detached_residual_geometry_sequence_fusion(args, samples, device)
+    finally:
+        if output_jsonl_handle is not None:
+            output_jsonl_handle.close()
+            args._output_jsonl_handle = None
 
     metrics = finalize_metrics(args, len(records), skipped, sums)
     print_summary(metrics)
     save_report(metrics, args.output_json)
+    if args.output_jsonl:
+        print(f"[EvalActionHead] saved records: {args.output_jsonl}")
     return 0
 
 
