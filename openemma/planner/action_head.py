@@ -897,6 +897,143 @@ class CurvatureOnlyDetachedResidualGeometrySequenceFusionHead(nn.Module):
         }
 
 
+class CurvatureResidualHead(nn.Module):
+    """Predict a per-step curvature residual from hidden state, ego history, and geometry."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        history_steps: int = 10,
+        ego_dim: int = 3,
+        qwen_embed_dim: int = 512,
+        ego_embed_dim: int = 256,
+        global_context_dim: int = 512,
+        geometry_step_embed_dim: int = 128,
+        residual_hidden_size: int = 256,
+        chunk_size: int = 10,
+        geometry_sequence_dim: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.history_steps = history_steps
+        self.ego_dim = ego_dim
+        self.qwen_embed_dim = qwen_embed_dim
+        self.ego_embed_dim = ego_embed_dim
+        self.global_context_dim = global_context_dim
+        self.geometry_step_embed_dim = geometry_step_embed_dim
+        self.residual_hidden_size = residual_hidden_size
+        self.chunk_size = chunk_size
+        self.geometry_sequence_dim = geometry_sequence_dim
+
+        ego_input_dim = history_steps * ego_dim
+        self.qwen_projection = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, qwen_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.ego_encoder = nn.Sequential(
+            nn.LayerNorm(ego_input_dim),
+            nn.Linear(ego_input_dim, ego_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.global_context = nn.Sequential(
+            nn.Linear(qwen_embed_dim + ego_embed_dim, global_context_dim),
+            nn.GELU(),
+        )
+        self.geometry_step_encoder = nn.Sequential(
+            nn.Linear(geometry_sequence_dim, geometry_step_embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.curvature_residual_fusion = nn.Sequential(
+            nn.Linear(global_context_dim + geometry_step_embed_dim, residual_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(residual_hidden_size, 1),
+        )
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+        geometry_sequence: torch.Tensor,
+    ) -> torch.Tensor:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, got {planning_hidden.shape[-1]}."
+            )
+        if ego_history_array.ndim != 3:
+            raise ValueError("ego_history_array must have shape [B, history_steps, ego_dim].")
+        expected_ego = (self.history_steps, self.ego_dim)
+        if tuple(ego_history_array.shape[1:]) != expected_ego:
+            raise ValueError(
+                f"ego_history_array trailing shape must be {expected_ego}, "
+                f"got {tuple(ego_history_array.shape[1:])}."
+            )
+        expected_geometry = (self.chunk_size, self.geometry_sequence_dim)
+        if geometry_sequence.ndim != 3 or tuple(geometry_sequence.shape[1:]) != expected_geometry:
+            raise ValueError(
+                f"geometry_sequence trailing shape must be {expected_geometry}, "
+                f"got {tuple(geometry_sequence.shape[1:])}."
+            )
+        if planning_hidden.shape[0] != ego_history_array.shape[0]:
+            raise ValueError("planning_hidden and ego_history_array must have the same batch size.")
+        if planning_hidden.shape[0] != geometry_sequence.shape[0]:
+            raise ValueError("planning_hidden and geometry_sequence must have the same batch size.")
+
+        qwen_embed = self.qwen_projection(planning_hidden)
+        ego_flat = ego_history_array.reshape(ego_history_array.shape[0], -1)
+        ego_embed = self.ego_encoder(ego_flat)
+        global_features = torch.cat([qwen_embed, ego_embed], dim=-1)
+        global_context = self.global_context(global_features).unsqueeze(1).expand(-1, self.chunk_size, -1)
+        geometry_embed = self.geometry_step_encoder(geometry_sequence)
+        residual_features = torch.cat([global_context, geometry_embed], dim=-1)
+        return self.curvature_residual_fusion(residual_features)
+
+
+class FrozenFusionCurvatureResidualHead(nn.Module):
+    """Frozen Fusion base action with a trainable curvature-only geometry residual."""
+
+    def __init__(
+        self,
+        frozen_fusion_head: FusionActionHead,
+        residual_head: CurvatureResidualHead,
+        residual_scale: float = 0.1,
+    ):
+        super().__init__()
+        self.frozen_fusion_head = frozen_fusion_head
+        self.residual_head = residual_head
+        self.residual_scale = residual_scale
+        for parameter in self.frozen_fusion_head.parameters():
+            parameter.requires_grad = False
+        self.frozen_fusion_head.eval()
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+        geometry_sequence: torch.Tensor,
+        detach_geometry: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        geometry_for_action = geometry_sequence.detach() if detach_geometry else geometry_sequence
+        with torch.no_grad():
+            base_action = self.frozen_fusion_head(planning_hidden, ego_history_array)
+        residual_curvature = self.residual_head(planning_hidden, ego_history_array, geometry_for_action)
+        final_speed = base_action[..., 0:1]
+        final_curvature = base_action[..., 1:2] + self.residual_scale * residual_curvature
+        action_chunk = torch.cat([final_speed, final_curvature], dim=-1)
+        return {
+            "action_chunk": action_chunk,
+            "base_action": base_action,
+            "residual_curvature": residual_curvature,
+        }
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
@@ -1142,6 +1279,46 @@ def build_curvature_only_detached_residual_geometry_sequence_fusion_head(
         geometry_sequence_dim=geometry_sequence_dim,
         residual_scale=residual_scale,
         dropout=dropout,
+    )
+
+
+def build_curvature_residual_head(
+    qwen_hidden_dim: int = 3584,
+    history_steps: int = 10,
+    ego_dim: int = 3,
+    qwen_embed_dim: int = 512,
+    ego_embed_dim: int = 256,
+    global_context_dim: int = 512,
+    geometry_step_embed_dim: int = 128,
+    residual_hidden_size: int = 256,
+    chunk_size: int = 10,
+    geometry_sequence_dim: int = 2,
+    dropout: float = 0.1,
+) -> CurvatureResidualHead:
+    return CurvatureResidualHead(
+        qwen_hidden_dim=qwen_hidden_dim,
+        history_steps=history_steps,
+        ego_dim=ego_dim,
+        qwen_embed_dim=qwen_embed_dim,
+        ego_embed_dim=ego_embed_dim,
+        global_context_dim=global_context_dim,
+        geometry_step_embed_dim=geometry_step_embed_dim,
+        residual_hidden_size=residual_hidden_size,
+        chunk_size=chunk_size,
+        geometry_sequence_dim=geometry_sequence_dim,
+        dropout=dropout,
+    )
+
+
+def build_frozen_fusion_curvature_residual_head(
+    frozen_fusion_head: FusionActionHead,
+    residual_head: CurvatureResidualHead,
+    residual_scale: float = 0.1,
+) -> FrozenFusionCurvatureResidualHead:
+    return FrozenFusionCurvatureResidualHead(
+        frozen_fusion_head=frozen_fusion_head,
+        residual_head=residual_head,
+        residual_scale=residual_scale,
     )
 
 

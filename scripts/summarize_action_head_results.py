@@ -34,7 +34,11 @@ RESULT_COLUMNS = [
     "detach_geometry_for_action",
     "residual_target",
     "speed_source",
+    "freeze_fusion_base",
+    "fusion_checkpoint_path",
     "residual_curvature_abs_mean",
+    "base_speed_mae_mps",
+    "base_curvature_mae_x100",
 ]
 
 IMPROVEMENT_COLUMNS = [
@@ -68,6 +72,8 @@ def parse_args():
     parser.add_argument("--detached_residual_geometry_sequence_heldout_json", type=str, default=None)
     parser.add_argument("--curvature_only_detached_residual_geometry_sequence_train_json", type=str, default=None)
     parser.add_argument("--curvature_only_detached_residual_geometry_sequence_heldout_json", type=str, default=None)
+    parser.add_argument("--frozen_fusion_curvature_residual_train_json", type=str, default=None)
+    parser.add_argument("--frozen_fusion_curvature_residual_heldout_json", type=str, default=None)
     parser.add_argument("--output_markdown", type=str, default="/root/autodl-tmp/action_head_results_summary.md")
     parser.add_argument("--output_csv", type=str, default="/root/autodl-tmp/action_head_results_summary.csv")
     return parser.parse_args()
@@ -114,7 +120,11 @@ def result_row(model: str, split: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "detach_geometry_for_action": data.get("detach_geometry_for_action"),
         "residual_target": data.get("residual_target"),
         "speed_source": data.get("speed_source"),
+        "freeze_fusion_base": data.get("freeze_fusion_base"),
+        "fusion_checkpoint_path": data.get("fusion_checkpoint_path"),
         "residual_curvature_abs_mean": data.get("residual_curvature_abs_mean"),
+        "base_speed_mae_mps": data.get("base_speed_mae_mps"),
+        "base_curvature_mae_x100": data.get("base_curvature_mae_x100"),
     }
 
 
@@ -451,6 +461,24 @@ def main():
                 "held-out",
                 args.curvature_only_detached_residual_geometry_sequence_heldout_json,
                 "curvature-only detached residual geometry sequence held-out",
+            )
+        )
+    if args.frozen_fusion_curvature_residual_train_json:
+        entries.append(
+            (
+                "frozen-fusion-curvature-residual",
+                "train",
+                args.frozen_fusion_curvature_residual_train_json,
+                "frozen fusion curvature residual train",
+            )
+        )
+    if args.frozen_fusion_curvature_residual_heldout_json:
+        entries.append(
+            (
+                "frozen-fusion-curvature-residual",
+                "held-out",
+                args.frozen_fusion_curvature_residual_heldout_json,
+                "frozen fusion curvature residual held-out",
             )
         )
 

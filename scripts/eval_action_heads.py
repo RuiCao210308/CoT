@@ -19,10 +19,12 @@ if PLANNER_DIR not in sys.path:
 
 from action_head import (
     ContinuousActionHead,
+    CurvatureResidualHead,
     CurvatureOnlyDetachedResidualGeometrySequenceFusionHead,
     DecoupledEgoVLAActionHead,
     DetachedResidualGeometrySequenceFusionHead,
     EgoOnlyActionHead,
+    FrozenFusionCurvatureResidualHead,
     FusionActionHead,
     OracleGeometryFusionHead,
     PredictedGeometryFusionHead,
@@ -63,6 +65,7 @@ MODEL_TYPES = (
     "predicted_geometry_sequence_fusion",
     "detached_residual_geometry_sequence_fusion",
     "curvature_only_detached_residual_geometry_sequence_fusion",
+    "frozen_fusion_curvature_residual",
 )
 
 
@@ -206,6 +209,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "predicted_geometry_sequence_fusion",
             "detached_residual_geometry_sequence_fusion",
             "curvature_only_detached_residual_geometry_sequence_fusion",
+            "frozen_fusion_curvature_residual",
         ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
@@ -224,6 +228,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "predicted_geometry_sequence_fusion",
             "detached_residual_geometry_sequence_fusion",
             "curvature_only_detached_residual_geometry_sequence_fusion",
+            "frozen_fusion_curvature_residual",
         ):
             prompt_fields = get_prompt_fields(record)
             if prompt_fields is None:
@@ -267,6 +272,12 @@ def collect_samples(records: List[Dict[str, Any]], args):
                 continue
             sample["target_waypoints"] = target_waypoints
         elif args.model_type == "curvature_only_detached_residual_geometry_sequence_fusion":
+            target_waypoints = make_waypoint_target(record)
+            if target_waypoints is None:
+                skipped["invalid_target_future_waypoints_local"] += 1
+                continue
+            sample["target_waypoints"] = target_waypoints
+        elif args.model_type == "frozen_fusion_curvature_residual":
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -576,6 +587,66 @@ def load_curvature_only_detached_residual_geometry_sequence_modules(
     return {"predictor": predictor, "head": head, "config": config}
 
 
+def load_frozen_fusion_curvature_residual_modules(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    config = checkpoint.get("config", {})
+    predictor = GeometrySequencePredictor(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        fusion_hidden_size=int(config.get("predictor_fusion_hidden_size", 1024)),
+        future_steps=int(config.get("chunk_size", 10)),
+        geometry_sequence_dim=int(config.get("geometry_sequence_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    predictor_state = checkpoint.get("geometry_sequence_predictor_state_dict")
+    if predictor_state is None:
+        raise KeyError("checkpoint missing geometry_sequence_predictor_state_dict")
+    predictor.load_state_dict(predictor_state)
+    predictor.eval()
+
+    residual_head = CurvatureResidualHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        history_steps=int(config.get("history_steps", 10)),
+        ego_dim=int(config.get("ego_dim", 3)),
+        qwen_embed_dim=int(config.get("qwen_embed_dim", 512)),
+        ego_embed_dim=int(config.get("ego_embed_dim", 256)),
+        global_context_dim=int(config.get("global_context_dim", 512)),
+        geometry_step_embed_dim=int(config.get("geometry_step_embed_dim", 128)),
+        residual_hidden_size=int(config.get("residual_hidden_size", 256)),
+        chunk_size=int(config.get("chunk_size", 10)),
+        geometry_sequence_dim=int(config.get("geometry_sequence_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    residual_state = checkpoint.get("curvature_residual_head_state_dict")
+    if residual_state is None:
+        raise KeyError("checkpoint missing curvature_residual_head_state_dict")
+    residual_head.load_state_dict(residual_state)
+    residual_head.eval()
+
+    fusion_checkpoint_path = config.get("fusion_checkpoint_path")
+    if not fusion_checkpoint_path:
+        raise KeyError("checkpoint config missing fusion_checkpoint_path")
+    fusion_checkpoint = load_checkpoint(str(fusion_checkpoint_path), device)
+    frozen_fusion_head = load_fusion_head(fusion_checkpoint, device)
+    head = FrozenFusionCurvatureResidualHead(
+        frozen_fusion_head=frozen_fusion_head,
+        residual_head=residual_head,
+        residual_scale=float(config.get("residual_scale", 0.1)),
+    ).to(device)
+    head.eval()
+    return {
+        "predictor": predictor,
+        "head": head,
+        "residual_head": residual_head,
+        "config": config,
+    }
+
+
 def resolve_consistency_dt(args, checkpoint: Dict[str, Any]) -> float:
     if args.dt is not None:
         return float(args.dt)
@@ -772,6 +843,8 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "detach_geometry_for_action": sums.get("detach_geometry_for_action"),
         "residual_target": sums.get("residual_target"),
         "speed_source": sums.get("speed_source"),
+        "freeze_fusion_base": sums.get("freeze_fusion_base"),
+        "fusion_checkpoint_path": sums.get("fusion_checkpoint_path"),
         "residual_curvature_abs_mean": None,
         "base_speed_mae_mps": None,
         "base_curvature_mae_x100": None,
@@ -867,6 +940,9 @@ def print_summary(metrics: Dict[str, Any]):
     if metrics.get("residual_target") is not None:
         print(f"residual_target={metrics['residual_target']}")
         print(f"speed_source={metrics['speed_source']}")
+    if metrics.get("freeze_fusion_base") is not None:
+        print(f"freeze_fusion_base={metrics['freeze_fusion_base']}")
+        print(f"fusion_checkpoint_path={metrics['fusion_checkpoint_path']}")
     if metrics.get("residual_curvature_abs_mean") is not None:
         print(f"residual_curvature_abs_mean={metrics['residual_curvature_abs_mean']}")
         print(f"base_speed_mae_mps={metrics['base_speed_mae_mps']}")
@@ -1303,6 +1379,58 @@ def evaluate_curvature_only_detached_residual_geometry_sequence_fusion(
     return sums
 
 
+def evaluate_frozen_fusion_curvature_residual(
+    args,
+    samples: List[Dict[str, Any]],
+    device: torch.device,
+):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    modules = load_frozen_fusion_curvature_residual_modules(checkpoint, device)
+    predictor = modules["predictor"]
+    head = modules["head"]
+    config = modules["config"]
+    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    sums = Counter()
+    sums["geometry_sequence_dim"] = int(config.get("geometry_sequence_dim", 2))
+    sums["geometry_sequence_schema"] = config.get("geometry_sequence_schema", GEOMETRY_SEQUENCE_SCHEMA)
+    sums["residual_scale"] = float(config.get("residual_scale", 0.1))
+    sums["detach_geometry_for_action"] = bool(config.get("detach_geometry_for_action", True))
+    sums["residual_target"] = str(config.get("residual_target", "curvature_only"))
+    sums["speed_source"] = str(config.get("speed_source", "frozen_fusion_base"))
+    sums["freeze_fusion_base"] = bool(config.get("freeze_fusion_base", True))
+    sums["fusion_checkpoint_path"] = str(config.get("fusion_checkpoint_path", ""))
+    with torch.no_grad():
+        for sample in samples:
+            inputs = build_qwen_inputs(
+                prompt=sample["planning_prompt"],
+                images=sample["image_path"],
+                processor=processor,
+                model=qwen_model,
+                args=args,
+                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+            )
+            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.residual_head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            pred_geometry_sequence = predictor(planning_hidden, ego_history)
+            geometry_for_action = pred_geometry_sequence.detach()
+            outputs = head(
+                planning_hidden,
+                ego_history,
+                geometry_for_action,
+                detach_geometry=True,
+            )
+            pred_train = outputs["action_chunk"]
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            update_metric_sums(sums, pred_train, target_train)
+            update_curvature_only_residual_metric_sums(sums, outputs, target_train)
+            target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_geometry_sequence.dtype)
+            update_geometry_sequence_metric_sums(sums, pred_geometry_sequence, target_waypoints)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -1347,8 +1475,10 @@ def main():
             sums = evaluate_predicted_geometry_sequence_fusion(args, samples, device)
         elif args.model_type == "detached_residual_geometry_sequence_fusion":
             sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
-        else:
+        elif args.model_type == "curvature_only_detached_residual_geometry_sequence_fusion":
             sums = evaluate_curvature_only_detached_residual_geometry_sequence_fusion(args, samples, device)
+        else:
+            sums = evaluate_frozen_fusion_curvature_residual(args, samples, device)
     finally:
         if output_jsonl_handle is not None:
             output_jsonl_handle.close()
