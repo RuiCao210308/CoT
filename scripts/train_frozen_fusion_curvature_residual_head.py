@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import random
 import sys
 from collections import Counter
 from typing import Any, Dict, List, Optional
@@ -58,6 +59,8 @@ def parse_args():
     parser.add_argument("--geometry_sequence_weight", type=float, default=0.5)
     parser.add_argument("--residual_scale", type=float, default=0.1)
     parser.add_argument("--dt", type=float, default=0.5)
+    parser.add_argument("--hidden_cache", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -110,6 +113,41 @@ def load_fusion_head_from_checkpoint(path: str, device: torch.device) -> FusionA
     for parameter in head.parameters():
         parameter.requires_grad = False
     return head
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_hidden_cache(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    cache = torch.load(path, map_location="cpu")
+    if cache.get("format") != "openemma_qwen_planning_hidden_cache_v1":
+        raise ValueError(f"unsupported hidden cache format: {cache.get('format')}")
+    if "hidden" not in cache or "record_to_hidden_index" not in cache:
+        raise KeyError("hidden cache must contain hidden and record_to_hidden_index")
+    return cache
+
+
+def cached_planning_hidden(cache: Dict[str, Any], record_index: int) -> torch.Tensor:
+    mapping = cache.get("record_to_hidden_index", {})
+    hidden_index = mapping.get(record_index)
+    if hidden_index is None:
+        hidden_index = mapping.get(str(record_index))
+    if hidden_index is None:
+        raise KeyError(f"hidden cache missing record_index={record_index}")
+    hidden = cache["hidden"][int(hidden_index)]
+    return hidden.unsqueeze(0)
 
 
 def resolve_image_path(record: Dict[str, Any], dataroot: str) -> Optional[str]:
@@ -169,7 +207,8 @@ def get_prompt_fields(record: Dict[str, Any]) -> Optional[Dict[str, str]]:
 def collect_samples(records: List[Dict[str, Any]], args):
     samples = []
     skipped = Counter()
-    for record in records:
+    use_hidden_cache = bool(args.hidden_cache)
+    for record_index, record in enumerate(records):
         if args.max_samples > 0 and len(samples) >= args.max_samples:
             break
 
@@ -185,26 +224,28 @@ def collect_samples(records: List[Dict[str, Any]], args):
         if ego_history is None:
             skipped["invalid_input_ego_history_array"] += 1
             continue
-        prompt_fields = get_prompt_fields(record)
-        if prompt_fields is None:
-            skipped["missing_input_system_or_planning_prompt"] += 1
-            continue
-        image_path = resolve_image_path(record, args.dataroot)
-        if image_path is None:
-            skipped["missing_image_path"] += 1
-            continue
+        prompt_fields = None if use_hidden_cache else get_prompt_fields(record)
+        image_path = None
+        if not use_hidden_cache:
+            if prompt_fields is None:
+                skipped["missing_input_system_or_planning_prompt"] += 1
+                continue
+            image_path = resolve_image_path(record, args.dataroot)
+            if image_path is None:
+                skipped["missing_image_path"] += 1
+                continue
 
-        samples.append(
-            {
-                "line_no": record.get("_line_no"),
-                "image_path": image_path,
-                "system_message": prompt_fields["system_message"],
-                "planning_prompt": prompt_fields["planning_prompt"],
-                "ego_history": ego_history.unsqueeze(0),
-                "target": target,
-                "target_waypoints": target_waypoints,
-            }
-        )
+        sample = {
+            "record_index": record_index,
+            "line_no": record.get("_line_no"),
+            "ego_history": ego_history.unsqueeze(0),
+            "target": target,
+            "target_waypoints": target_waypoints,
+        }
+        if prompt_fields is not None:
+            sample.update(prompt_fields)
+            sample["image_path"] = image_path
+        samples.append(sample)
     return samples, skipped
 
 
@@ -225,6 +266,7 @@ def qwen_train_message_builder(system_message: str):
 
 
 def train(args):
+    set_seed(args.seed)
     if args.batch_size != 1:
         raise ValueError(
             "train_frozen_fusion_curvature_residual_head.py currently supports batch_size=1 only."
@@ -255,7 +297,15 @@ def train(args):
         return 1
 
     device = resolve_device(args.device)
-    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    hidden_cache = load_hidden_cache(args.hidden_cache)
+    if hidden_cache is None:
+        qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    else:
+        qwen_model, processor = None, None
+        print(
+            f"[FrozenFusionCurvatureResidualTrain] using_hidden_cache={args.hidden_cache} "
+            f"num_cached={hidden_cache.get('num_cached')}"
+        )
     frozen_fusion_head = load_fusion_head_from_checkpoint(args.fusion_checkpoint, device)
     geometry_predictor = GeometrySequencePredictor(dropout=0.1).to(device)
     residual_head = CurvatureResidualHead(
@@ -283,17 +333,20 @@ def train(args):
         epoch_steps = 0
 
         for sample in samples:
-            inputs = build_qwen_inputs(
-                prompt=sample["planning_prompt"],
-                images=sample["image_path"],
-                processor=processor,
-                model=qwen_model,
-                args=args,
-                get_message_fn=qwen_train_message_builder(sample["system_message"]),
-            )
-            with torch.no_grad():
-                last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
-                planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            if hidden_cache is None:
+                inputs = build_qwen_inputs(
+                    prompt=sample["planning_prompt"],
+                    images=sample["image_path"],
+                    processor=processor,
+                    model=qwen_model,
+                    args=args,
+                    get_message_fn=qwen_train_message_builder(sample["system_message"]),
+                )
+                with torch.no_grad():
+                    last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+                    planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            else:
+                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
             planning_hidden = planning_hidden.to(device=device, dtype=next(residual_head.parameters()).dtype)
             ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
             target = sample["target"].to(device=device, dtype=planning_hidden.dtype)
@@ -406,6 +459,8 @@ def train(args):
             "speed_weight": args.speed_weight,
             "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
+            "seed": args.seed,
+            "hidden_cache": args.hidden_cache,
         },
         "source_action_schema": SOURCE_ACTION_SCHEMA,
         "train_action_schema": TRAIN_ACTION_SCHEMA,

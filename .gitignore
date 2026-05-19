@@ -18,27 +18,54 @@ env/
 
 # Project specific
 gpt_results/
+# =========================
+
 # Paper drafts / LaTeX outputs
+
+# =========================
+
 paper/
 
-# OpenEMMA-OFT outputs
+# =========================
+
+# OpenEMMA-OFT experiment outputs / figures / tables
+
+# =========================
+
 openemma_oft*/
+
 openemma_oft_figures/
+
 openemma_oft_paper_tables/
+
 *_paper_tables/
+
 trajectory_cases/
 
-# LaTeX auxiliary files
 *.aux
+
 *.log
+
 *.out
+
 *.fls
+
 *.fdb_latexmk
+
 *.synctex.gz
+
 *.toc
+
 *.bbl
+
 *.blg
+
 *.xdv
 
+# =========================
+
 # macOS
+
+# =========================
+
 .DS_Store
