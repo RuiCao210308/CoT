@@ -34,11 +34,11 @@ LINE_STYLES = {
     "stage7e": "-",
 }
 LINE_WIDTHS = {
-    "gt": 2.2,
-    "openemma_text": 1.9,
+    "gt": 2.3,
+    "openemma_text": 1.8,
     "fusion": 1.9,
-    "stage7d": 1.9,
-    "stage7e": 2.0,
+    "stage7d": 1.8,
+    "stage7e": 1.9,
 }
 PANEL_ORDER = [
     ("fusion_advantage", "(a) Fusion advantage"),
@@ -337,6 +337,11 @@ def candidate_record(item: Dict[str, Any]) -> Dict[str, Any]:
             for model in ["openemma_text", "ego_only", "qwen_hidden", "fusion", "stage7d", "stage7e"]
             if model in sample["models"]
         },
+        "fde": {
+            model: metric(sample, model, key="rollout_fde")
+            for model in ["openemma_text", "ego_only", "qwen_hidden", "fusion", "stage7d", "stage7e"]
+            if model in sample["models"]
+        },
         "improvement": {
             "stage7e_vs_text": improvement(sample, "openemma_text", "stage7e"),
             "stage7d_vs_text": improvement(sample, "openemma_text", "stage7d"),
@@ -399,7 +404,7 @@ def collect_plot_points(sample: Dict[str, Any]) -> List[List[float]]:
     return all_points
 
 
-def set_panel_limits(ax, sample: Dict[str, Any]):
+def set_panel_limits(ax, sample: Dict[str, Any], group: str):
     points = collect_plot_points(sample)
     if not points:
         return
@@ -407,11 +412,16 @@ def set_panel_limits(ax, sample: Dict[str, Any]):
     ys = [point[1] for point in points]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
-    x_pad = max(1.0, (x_max - x_min) * 0.12)
-    y_pad = max(0.5, (y_max - y_min) * 0.18)
+    x_span = max(x_max - x_min, 1e-6)
+    y_span = max(y_max - y_min, 1e-6)
+    min_y_span = 4.0 if group == "steady_low_curvature" else 3.0
+    display_y_span = max(y_span * 1.3, min_y_span)
+    y_center = 0.5 * (y_min + y_max)
+    x_pad = max(0.75, x_span * 0.1)
+    y_pad = max(0.25, display_y_span * 0.06)
     ax.set_xlim(x_min - x_pad, x_max + x_pad)
-    ax.set_ylim(y_min - y_pad, y_max + y_pad)
-    ax.set_aspect("equal", adjustable="box")
+    ax.set_ylim(y_center - 0.5 * display_y_span - y_pad, y_center + 0.5 * display_y_span + y_pad)
+    ax.set_aspect("auto")
 
 
 def plot_points(ax, points: List[List[float]], model: str, label: Optional[str] = None):
@@ -431,33 +441,6 @@ def plot_points(ax, points: List[List[float]], model: str, label: Optional[str] 
     ax.scatter([xs[-1]], [ys[-1]], color=COLORS.get(model, "#666666"), s=18, marker="s", zorder=4)
 
 
-def format_ade(value: Optional[float]) -> str:
-    return "n/a" if value is None else f"{value:.2f}"
-
-
-def panel_annotation(group: str, sample: Dict[str, Any]) -> str:
-    text_ade = metric(sample, "openemma_text")
-    fusion_ade = metric(sample, "fusion")
-    stage7d_ade = metric(sample, "stage7d")
-    stage7e_ade = metric(sample, "stage7e")
-    qwen_ade = metric(sample, "qwen_hidden")
-    ego_ade = metric(sample, "ego_only")
-    if group == "fusion_advantage":
-        return f"Fusion {format_ade(fusion_ade)} vs Text {format_ade(text_ade)}"
-    if group == "high_curvature":
-        candidates = [("7D", stage7d_ade), ("7E", stage7e_ade)]
-        candidates = [(name, ade) for name, ade in candidates if ade is not None]
-        best_name, best_ade = min(candidates, key=lambda item: item[1]) if candidates else ("7E", stage7e_ade)
-        return f"{best_name} {format_ade(best_ade)} vs Text {format_ade(text_ade)}"
-    if group == "speed_changing":
-        return f"7D {format_ade(stage7d_ade)} vs Text {format_ade(text_ade)}"
-    if group == "steady_low_curvature":
-        return f"Text {format_ade(text_ade)} vs Fusion {format_ade(fusion_ade)}"
-    if qwen_ade is not None and ego_ade is not None:
-        return f"Fusion {format_ade(fusion_ade)} vs Qwen {format_ade(qwen_ade)} / Ego {format_ade(ego_ade)}"
-    return ""
-
-
 def draw_case_panel(ax, group: str, title: str, sample: Dict[str, Any], add_labels: bool = False):
     ax.set_facecolor("white")
     gt = gt_points(sample)
@@ -471,24 +454,12 @@ def draw_case_panel(ax, group: str, title: str, sample: Dict[str, Any], add_labe
         if points:
             plot_points(ax, points, model, label=label if add_labels else None)
     ax.axhline(0.0, color="#B0B0B0", linewidth=0.6, linestyle="--", alpha=0.55)
-    ax.set_xlabel("Forward x (m)", fontsize=9)
-    ax.set_ylabel("Lateral y (m)", fontsize=9)
-    ax.set_title(title, fontsize=10, loc="left")
-    ax.grid(True, linewidth=0.45, color="#D0D0D0", alpha=0.55)
-    ax.tick_params(axis="both", labelsize=8)
-    set_panel_limits(ax, sample)
-    annotation = panel_annotation(group, sample)
-    if annotation:
-        ax.text(
-            0.98,
-            0.97,
-            annotation,
-            transform=ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=7.5,
-            bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#CCCCCC", "alpha": 0.9},
-        )
+    ax.set_xlabel("Forward x (m)", fontsize=8.5)
+    ax.set_ylabel("Lateral y (m)", fontsize=8.5)
+    ax.set_title(title, fontsize=9.5, loc="left", pad=4)
+    ax.grid(True, linewidth=0.4, color="#D0D0D0", alpha=0.5)
+    ax.tick_params(axis="both", labelsize=7.5)
+    set_panel_limits(ax, sample, group)
 
 
 def plot_case(group: str, sample: Dict[str, Any], output_dir: str):
@@ -497,11 +468,11 @@ def plot_case(group: str, sample: Dict[str, Any], output_dir: str):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(5.0, 4.4), dpi=200)
+    fig, ax = plt.subplots(figsize=(4.8, 3.7), dpi=220)
     fig.patch.set_facecolor("white")
     draw_case_panel(ax, group, group.replace("_", " ").title(), sample, add_labels=True)
     ax.legend(frameon=False, fontsize=8, loc="best")
-    fig.tight_layout()
+    fig.tight_layout(pad=0.6)
 
     png_path = os.path.join(output_dir, f"{group}.png")
     pdf_path = os.path.join(output_dir, f"{group}.pdf")
@@ -517,36 +488,42 @@ def plot_grid(selected: Dict[str, Optional[Dict[str, Any]]], output_dir: str):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.2), dpi=300)
+    from matplotlib.lines import Line2D
+
+    fig, axes = plt.subplots(2, 2, figsize=(6.9, 5.25), dpi=300)
     fig.patch.set_facecolor("white")
-    handles = []
-    labels = []
     for ax, (group, title) in zip(axes.ravel(), PANEL_ORDER):
         sample = selected.get(group)
         if sample is None:
             ax.axis("off")
             ax.set_title(title, fontsize=10, loc="left")
             continue
-        draw_case_panel(ax, group, title, sample, add_labels=True)
-        if not handles:
-            handles, labels = ax.get_legend_handles_labels()
-        legend = ax.get_legend()
-        if legend is not None:
-            legend.remove()
+        draw_case_panel(ax, group, title, sample, add_labels=False)
 
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.01),
-            ncol=5,
-            frameon=False,
-            fontsize=8.5,
-            handlelength=2.6,
-            columnspacing=1.2,
+    legend_models = [("gt", "GT")] + PLOT_MODELS
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=COLORS.get(model, "#666666"),
+            linestyle=LINE_STYLES.get(model, "-"),
+            linewidth=LINE_WIDTHS.get(model, 1.9),
+            label=label,
         )
-    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
+        for model, label in legend_models
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.995),
+        ncol=5,
+        frameon=False,
+        fontsize=8.2,
+        handlelength=2.3,
+        columnspacing=1.0,
+        borderaxespad=0.0,
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.955], pad=0.5, h_pad=1.0, w_pad=1.0)
     png_path = os.path.join(output_dir, "trajectory_cases_grid.png")
     pdf_path = os.path.join(output_dir, "trajectory_cases_grid.pdf")
     fig.savefig(png_path, bbox_inches="tight", facecolor="white")
