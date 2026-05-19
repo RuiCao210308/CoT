@@ -1,0 +1,222 @@
+[
+  {
+    "frame_idx": 21,
+    "group": "high_curvature",
+    "models": {
+      "ego_only": {
+        "final_lateral_error": 10.820113969748835,
+        "lateral_mae": 4.379580613793455,
+        "rollout_ade": 16.86056341028787,
+        "rollout_fde": 34.44172027586195
+      },
+      "fusion": {
+        "final_lateral_error": 3.3076576375954776,
+        "lateral_mae": 1.332422556740488,
+        "rollout_ade": 4.783771783391694,
+        "rollout_fde": 10.12309041885453
+      },
+      "openemma_text": {
+        "final_lateral_error": 1.779178085785773,
+        "lateral_mae": 0.8293526869861324,
+        "rollout_ade": 7.980366406058417,
+        "rollout_fde": 20.647555401632168
+      },
+      "qwen_hidden": {
+        "final_lateral_error": 10.388844084616903,
+        "lateral_mae": 4.2187147067889095,
+        "rollout_ade": 6.603209347553159,
+        "rollout_fde": 15.944605676854012
+      },
+      "stage7c": {
+        "final_lateral_error": 12.077814253032626,
+        "lateral_mae": 4.920001334096166,
+        "rollout_ade": 5.620882497716012,
+        "rollout_fde": 14.231532286799949
+      },
+      "stage7d": {
+        "final_lateral_error": 3.7557872858296477,
+        "lateral_mae": 1.4200155806556842,
+        "rollout_ade": 2.7111213414229196,
+        "rollout_fde": 7.209487947602764
+      },
+      "stage7e": {
+        "final_lateral_error": 4.0392128526163535,
+        "lateral_mae": 1.6279813486413826,
+        "rollout_ade": 3.3323285576305492,
+        "rollout_fde": 8.43551566877402
+      }
+    },
+    "pdf": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/high_curvature.pdf",
+    "png": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/high_curvature.png",
+    "sample_token": "e161fe6b9dfb4740b79775873c1f7ec6",
+    "scene_name": "scene-0032",
+    "selected": true,
+    "target_abs_curvature_x100": 1.4947452722117305,
+    "target_speed_change": 4.361897945404053
+  },
+  {
+    "frame_idx": 21,
+    "group": "speed_changing",
+    "models": {
+      "ego_only": {
+        "final_lateral_error": 10.820113969748835,
+        "lateral_mae": 4.379580613793455,
+        "rollout_ade": 16.86056341028787,
+        "rollout_fde": 34.44172027586195
+      },
+      "fusion": {
+        "final_lateral_error": 3.3076576375954776,
+        "lateral_mae": 1.332422556740488,
+        "rollout_ade": 4.783771783391694,
+        "rollout_fde": 10.12309041885453
+      },
+      "openemma_text": {
+        "final_lateral_error": 1.779178085785773,
+        "lateral_mae": 0.8293526869861324,
+        "rollout_ade": 7.980366406058417,
+        "rollout_fde": 20.647555401632168
+      },
+      "qwen_hidden": {
+        "final_lateral_error": 10.388844084616903,
+        "lateral_mae": 4.2187147067889095,
+        "rollout_ade": 6.603209347553159,
+        "rollout_fde": 15.944605676854012
+      },
+      "stage7c": {
+        "final_lateral_error": 12.077814253032626,
+        "lateral_mae": 4.920001334096166,
+        "rollout_ade": 5.620882497716012,
+        "rollout_fde": 14.231532286799949
+      },
+      "stage7d": {
+        "final_lateral_error": 3.7557872858296477,
+        "lateral_mae": 1.4200155806556842,
+        "rollout_ade": 2.7111213414229196,
+        "rollout_fde": 7.209487947602764
+      },
+      "stage7e": {
+        "final_lateral_error": 4.0392128526163535,
+        "lateral_mae": 1.6279813486413826,
+        "rollout_ade": 3.3323285576305492,
+        "rollout_fde": 8.43551566877402
+      }
+    },
+    "pdf": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/speed_changing.pdf",
+    "png": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/speed_changing.png",
+    "sample_token": "e161fe6b9dfb4740b79775873c1f7ec6",
+    "scene_name": "scene-0032",
+    "selected": true,
+    "target_abs_curvature_x100": 1.4947452722117305,
+    "target_speed_change": 4.361897945404053
+  },
+  {
+    "frame_idx": 13,
+    "group": "steady_low_curvature",
+    "models": {
+      "ego_only": {
+        "final_lateral_error": 0.01086551251744606,
+        "lateral_mae": 0.058975463251400836,
+        "rollout_ade": 26.556653876909746,
+        "rollout_fde": 48.18711767297823
+      },
+      "fusion": {
+        "final_lateral_error": 0.5673544804509744,
+        "lateral_mae": 0.1360518295831176,
+        "rollout_ade": 7.109971325810093,
+        "rollout_fde": 13.684620138550484
+      },
+      "openemma_text": {
+        "final_lateral_error": 1.2892250233569165,
+        "lateral_mae": 0.44188570527195276,
+        "rollout_ade": 0.6474110598888192,
+        "rollout_fde": 1.5694474201325355
+      },
+      "qwen_hidden": {
+        "final_lateral_error": 0.7841904940535613,
+        "lateral_mae": 0.25978028077768267,
+        "rollout_ade": 13.2680487526934,
+        "rollout_fde": 24.55706568376009
+      },
+      "stage7c": {
+        "final_lateral_error": 1.2176566226729806,
+        "lateral_mae": 0.5255306101413931,
+        "rollout_ade": 6.2170820117455445,
+        "rollout_fde": 11.546051936516811
+      },
+      "stage7d": {
+        "final_lateral_error": 1.1215769126184663,
+        "lateral_mae": 0.42590919161201934,
+        "rollout_ade": 7.348043594760661,
+        "rollout_fde": 13.457702559502165
+      },
+      "stage7e": {
+        "final_lateral_error": 1.1477985440090692,
+        "lateral_mae": 0.4514369121419355,
+        "rollout_ade": 6.73734581349223,
+        "rollout_fde": 12.331906204121037
+      }
+    },
+    "pdf": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/steady_low_curvature.pdf",
+    "png": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/steady_low_curvature.png",
+    "sample_token": "229e61dc17244d5b82f8decf2fcac5ea",
+    "scene_name": "scene-0124",
+    "selected": true,
+    "target_abs_curvature_x100": 0.061642756263609044,
+    "target_speed_change": 0.21617412567138672
+  },
+  {
+    "frame_idx": 23,
+    "group": "fusion_advantage",
+    "models": {
+      "ego_only": {
+        "final_lateral_error": 2.465551524996322,
+        "lateral_mae": 1.0654689577057712,
+        "rollout_ade": 15.150227760436442,
+        "rollout_fde": 28.67902202901914
+      },
+      "fusion": {
+        "final_lateral_error": 1.4646648721537885,
+        "lateral_mae": 0.5346198132544713,
+        "rollout_ade": 1.0400697242614685,
+        "rollout_fde": 2.560697711970491
+      },
+      "openemma_text": {
+        "final_lateral_error": 3.330356892064785,
+        "lateral_mae": 1.1772290893294612,
+        "rollout_ade": 2.1872958804871523,
+        "rollout_fde": 5.9342827857035045
+      },
+      "qwen_hidden": {
+        "final_lateral_error": 2.6114460776557,
+        "lateral_mae": 1.1171063056319226,
+        "rollout_ade": 8.575403666194955,
+        "rollout_fde": 16.377766068655745
+      },
+      "stage7c": {
+        "final_lateral_error": 4.211772240682528,
+        "lateral_mae": 1.8536064841076723,
+        "rollout_ade": 2.4467532072203,
+        "rollout_fde": 4.250706903434131
+      },
+      "stage7d": {
+        "final_lateral_error": 2.1522964725803173,
+        "lateral_mae": 0.883552146456649,
+        "rollout_ade": 2.3733202993321902,
+        "rollout_fde": 5.660045538175118
+      },
+      "stage7e": {
+        "final_lateral_error": 2.706059684410348,
+        "lateral_mae": 1.1266832846159074,
+        "rollout_ade": 1.4027163907523446,
+        "rollout_fde": 3.390743305939961
+      }
+    },
+    "pdf": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/fusion_advantage.pdf",
+    "png": "/root/autodl-tmp/openemma_oft_figures/trajectory_cases/fusion_advantage.png",
+    "sample_token": "5d1c94a4e79c4ae8ab8a58977826b106",
+    "scene_name": "scene-0014",
+    "selected": true,
+    "target_abs_curvature_x100": 0.37437898106873035,
+    "target_speed_change": 1.559807300567627
+  }
+]
