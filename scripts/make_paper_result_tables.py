@@ -82,7 +82,9 @@ def parse_args():
     parser.add_argument("--scenario_json", required=True)
     parser.add_argument("--rollout_json", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--underline_second", action=argparse.BooleanOptionalAction, default=True)
+    parser.set_defaults(underline_second=True)
+    parser.add_argument("--underline_second", dest="underline_second", action="store_true")
+    parser.add_argument("--no_underline_second", dest="underline_second", action="store_false")
     return parser.parse_args()
 
 
