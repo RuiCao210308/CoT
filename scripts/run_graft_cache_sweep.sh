@@ -7,14 +7,20 @@ DATAROOT=/root/autodl-tmp/data/nuscenes
 MODEL_PATH=qwen
 FUSION_CKPT=/root/autodl-tmp/openemma_oft_overnight_100scenes_4090_e3/fusion_e3/fusion_action_head.pt
 CACHE_ROOT=/root/autodl-tmp/qwen_hidden_cache_trainval_100scenes
-SWEEP_ROOT=/root/autodl-tmp/graft_cache_sweep_100scenes
+SWEEP_ROOT=${SWEEP_ROOT:-/root/autodl-tmp/graft_cache_sweep_100scenes_$(date +%Y%m%d_%H%M%S)}
 
 TRAIN_CACHE="${CACHE_ROOT}/train_cache.pt"
 TEST_CACHE="${CACHE_ROOT}/test_cache.pt"
 SUMMARY_CSV="${SWEEP_ROOT}/summary.csv"
 SUMMARY_TXT="${SWEEP_ROOT}/summary.txt"
 
-mkdir -p "${CACHE_ROOT}" "${SWEEP_ROOT}"
+mkdir -p "${CACHE_ROOT}"
+if [[ -e "${SWEEP_ROOT}" ]]; then
+  echo "[GraftCacheSweep] refusing to overwrite existing SWEEP_ROOT=${SWEEP_ROOT}" >&2
+  exit 1
+fi
+mkdir -p "${SWEEP_ROOT}"
+echo "[GraftCacheSweep] SWEEP_ROOT=${SWEEP_ROOT}"
 
 if [[ ! -s "${TRAIN_CACHE}" ]]; then
   python3 scripts/build_qwen_hidden_cache.py --jsonl "${TRAIN_JSONL}" --model-path "${MODEL_PATH}" --dataroot "${DATAROOT}" --output_cache "${TRAIN_CACHE}" --device cuda

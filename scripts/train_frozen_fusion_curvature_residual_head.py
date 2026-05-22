@@ -36,6 +36,7 @@ from waypoint_metrics import waypoint_ade, waypoint_fde, waypoint_l1_loss
 SOURCE_ACTION_SCHEMA = ["speed_mps", "curvature_1pm"]
 TRAIN_ACTION_SCHEMA = ["speed_mps", "curvature_x100"]
 WAYPOINT_SCHEMA = ["x_m_local", "y_m_local"]
+EXPECTED_QWEN_HIDDEN_DIM = 3584
 
 
 def parse_args():
@@ -136,6 +137,13 @@ def load_hidden_cache(path: Optional[str]) -> Optional[Dict[str, Any]]:
         raise ValueError(f"unsupported hidden cache format: {cache.get('format')}")
     if "hidden" not in cache or "record_to_hidden_index" not in cache:
         raise KeyError("hidden cache must contain hidden and record_to_hidden_index")
+    hidden = cache["hidden"]
+    if not isinstance(hidden, torch.Tensor):
+        raise TypeError("hidden cache field 'hidden' must be a torch.Tensor")
+    if hidden.ndim != 2 or hidden.shape[1] != EXPECTED_QWEN_HIDDEN_DIM:
+        raise ValueError(
+            f"hidden cache tensor must have shape [N,{EXPECTED_QWEN_HIDDEN_DIM}], got {tuple(hidden.shape)}"
+        )
     return cache
 
 
@@ -147,6 +155,11 @@ def cached_planning_hidden(cache: Dict[str, Any], record_index: int) -> torch.Te
     if hidden_index is None:
         raise KeyError(f"hidden cache missing record_index={record_index}")
     hidden = cache["hidden"][int(hidden_index)]
+    if hidden.shape != (EXPECTED_QWEN_HIDDEN_DIM,):
+        raise ValueError(
+            f"hidden cache row for record_index={record_index} must have shape "
+            f"({EXPECTED_QWEN_HIDDEN_DIM},), got {tuple(hidden.shape)}"
+        )
     return hidden.unsqueeze(0)
 
 

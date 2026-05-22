@@ -32,6 +32,9 @@ def parse_args():
     return parser.parse_args()
 
 
+EXPECTED_HIDDEN_DIM = 3584
+
+
 def load_jsonl_records(jsonl_path: str):
     records = []
     skipped = Counter()
@@ -166,7 +169,13 @@ def main():
         entry["skip_reason"] = None
         cache_records.append(entry)
 
-    hidden = torch.stack(hidden_rows, dim=0) if hidden_rows else torch.empty(0, 0, dtype=torch.float32)
+    hidden = (
+        torch.stack(hidden_rows, dim=0)
+        if hidden_rows
+        else torch.empty(0, EXPECTED_HIDDEN_DIM, dtype=torch.float32)
+    )
+    if hidden.ndim != 2 or hidden.shape[1] != EXPECTED_HIDDEN_DIM:
+        raise ValueError(f"hidden cache tensor must have shape [N,{EXPECTED_HIDDEN_DIM}], got {tuple(hidden.shape)}")
     record_to_hidden_index = {
         int(entry["record_index"]): int(entry["hidden_index"])
         for entry in cache_records
