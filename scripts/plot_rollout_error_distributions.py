@@ -87,6 +87,7 @@ def parse_args():
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
     parser.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS)
     parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--dedup_keep", choices=("first", "last"), default="last")
     return parser.parse_args()
 
 
@@ -118,12 +119,11 @@ def canonical_model_name(value: Any) -> Optional[str]:
     if not normalized:
         return None
     lookup = alias_lookup()
-    if normalized in lookup:
-        return lookup[normalized]
-    for alias, canonical in lookup.items():
-        if alias and (normalized == alias or normalized.endswith(f"_{alias}") or alias in normalized):
-            return canonical
-    return None
+    return lookup.get(normalized)
+
+
+def canonical_or_normalized_model_name(value: Any) -> Optional[str]:
+    return canonical_model_name(value) or normalize_name(value) or None
 
 
 def finite_number(value: Any) -> Optional[float]:
@@ -168,7 +168,7 @@ def load_samples(path: str) -> pd.DataFrame:
                 warn(f"skipping JSON decode error at line {line_no}")
                 continue
             raw_model = first_present(record, ("model", "model_name", "name", "method", "variant"))
-            canonical = canonical_model_name(raw_model)
+            canonical = canonical_or_normalized_model_name(raw_model)
             row = dict(record)
             for nested_key in ("metrics", "rollout_metrics"):
                 nested = record.get(nested_key)
@@ -195,7 +195,11 @@ def requested_models(values: Iterable[str]) -> List[str]:
 def filter_models(df: pd.DataFrame, models: Sequence[str]) -> pd.DataFrame:
     if df.empty:
         return df
-    unknown = sorted(str(value) for value in df["_raw_model"].dropna().unique() if canonical_model_name(value) is None)
+    unknown = sorted(
+        str(value)
+        for value in df["_raw_model"].dropna().unique()
+        if canonical_model_name(value) is None and normalize_name(value) not in models
+    )
     if unknown:
         warn(f"unrecognized model names skipped: {', '.join(unknown)}")
     available = set(df["model"].dropna().unique())
@@ -204,6 +208,33 @@ def filter_models(df: pd.DataFrame, models: Sequence[str]) -> pd.DataFrame:
             aliases = sorted(MODEL_ALIASES.get(model, {model}))
             warn(f"requested model '{model}' not found; aliases tried: {', '.join(aliases)}")
     return df[df["model"].isin(models)].copy()
+
+
+def log_value_counts(label: str, values: pd.Series) -> None:
+    info(label)
+    counts = values.fillna("<unmapped>").astype(str).value_counts(dropna=False).sort_index()
+    for name, count in counts.items():
+        info(f"  {name}: {int(count)}")
+
+
+def deduplicate_samples(df: pd.DataFrame, keep: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    duplicate_mask = df.duplicated(subset=["model", "sample_key"], keep=False)
+    if duplicate_mask.any():
+        duplicate_pairs = (
+            df.loc[duplicate_mask, ["model", "sample_key"]]
+            .value_counts()
+            .reset_index(name="count")
+            .sort_values(["model", "sample_key"])
+        )
+        warn(
+            "found duplicate canonical model + sample_token/sample_key pairs; "
+            f"keeping {keep} occurrence for each pair"
+        )
+        for row in duplicate_pairs.itertuples(index=False):
+            warn(f"duplicate pair model={row.model} sample_key={row.sample_key} count={int(row.count)}")
+    return df.drop_duplicates(subset=["model", "sample_key"], keep=keep).copy()
 
 
 def numeric_metric_frame(df: pd.DataFrame, metrics: Sequence[str]) -> pd.DataFrame:
@@ -606,9 +637,13 @@ def main() -> int:
     df = load_samples(args.samples_jsonl)
     if df.empty:
         raise ValueError(f"no usable records found in {args.samples_jsonl}")
+    log_value_counts("raw model counts", df["_raw_model"])
+    log_value_counts("canonical model counts after alias mapping", df["model"])
     df = filter_models(df, models)
     if df.empty:
         raise ValueError("no records left after model alias filtering")
+    df = deduplicate_samples(df, args.dedup_keep)
+    log_value_counts("canonical model counts after dedup", df["model"])
     df = numeric_metric_frame(df, plot_metrics)
 
     outputs: List[str] = []
