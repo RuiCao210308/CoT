@@ -24,6 +24,7 @@ from action_head import (
     FusionActionHead,
     GatedGeometryResidualFusionHead,
     GeometryDescriptorHead,
+    QueryGatedResidualHead,
     action_chunk_l1_loss,
 )
 from geometry_sequence_predictor import GEOMETRY_SEQUENCE_SCHEMA, GeometrySequencePredictor
@@ -46,7 +47,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train frozen Fusion base with curvature-only geometry residual.")
     parser.add_argument(
         "--model_type",
-        choices=("frozen_fusion_curvature_residual", "gated_geometry_residual_fusion"),
+        choices=(
+            "frozen_fusion_curvature_residual",
+            "gated_geometry_residual_fusion",
+            "query_gated_geometry_residual_fusion",
+        ),
         default="frozen_fusion_curvature_residual",
     )
     parser.add_argument("--jsonl", type=str, default="/root/autodl-tmp/action_chunks_gt_waypoint_trainval_100scenes_train.jsonl")
@@ -69,6 +74,9 @@ def parse_args():
     parser.add_argument("--geometry_descriptor_weight", type=float, default=0.5)
     parser.add_argument("--gate_reg_weight", type=float, default=0.0)
     parser.add_argument("--descriptor_dim", type=int, default=6)
+    parser.add_argument("--query_decoder_dim", type=int, default=256)
+    parser.add_argument("--query_decoder_layers", type=int, default=1)
+    parser.add_argument("--query_decoder_heads", type=int, default=4)
     parser.add_argument("--residual_scale", type=float, default=0.1)
     parser.add_argument("--dt", type=float, default=0.5)
     parser.add_argument("--hidden_cache", type=str, default=None)
@@ -342,13 +350,15 @@ def planning_hidden_for_sample(sample, args, hidden_cache, qwen_model, processor
 
 
 def train_gated_geometry_residual_fusion(args):
+    is_query_decoder = args.model_type == "query_gated_geometry_residual_fusion"
+    decoder_type = "query" if is_query_decoder else "mlp"
     set_seed(args.seed)
     if args.batch_size != 1:
         raise ValueError(
             "train_frozen_fusion_curvature_residual_head.py currently supports batch_size=1 only."
         )
     if args.descriptor_dim != 6:
-        raise ValueError("gated_geometry_residual_fusion currently expects --descriptor_dim 6.")
+        raise ValueError(f"{args.model_type} currently expects --descriptor_dim 6.")
 
     os.makedirs(args.output_dir, exist_ok=True)
     records, skipped = load_jsonl_records(args.jsonl)
@@ -365,6 +375,7 @@ def train_gated_geometry_residual_fusion(args):
     print(
         f"[GatedGeometryResidualFusionTrain] fusion_checkpoint={args.fusion_checkpoint} "
         f"freeze_fusion_base=True descriptor_dim={args.descriptor_dim} "
+        f"decoder_type={decoder_type} "
         f"geometry_descriptor_weight={args.geometry_descriptor_weight} "
         f"gate_reg_weight={args.gate_reg_weight} residual_scale={args.residual_scale}"
     )
@@ -388,10 +399,21 @@ def train_gated_geometry_residual_fusion(args):
         descriptor_dim=args.descriptor_dim,
         dropout=0.1,
     ).to(device)
-    gated_residual_head = ChannelWiseGatedResidualHead(
-        descriptor_dim=args.descriptor_dim,
-        dropout=0.1,
-    ).to(device)
+    if is_query_decoder:
+        gated_residual_head = QueryGatedResidualHead(
+            descriptor_dim=args.descriptor_dim,
+            decoder_dim=args.query_decoder_dim,
+            num_queries=10,
+            action_dim=2,
+            num_layers=args.query_decoder_layers,
+            num_heads=args.query_decoder_heads,
+            dropout=0.1,
+        ).to(device)
+    else:
+        gated_residual_head = ChannelWiseGatedResidualHead(
+            descriptor_dim=args.descriptor_dim,
+            dropout=0.1,
+        ).to(device)
     head = GatedGeometryResidualFusionHead(
         frozen_fusion_head=frozen_fusion_head,
         geometry_descriptor_head=geometry_descriptor_head,
@@ -509,7 +531,7 @@ def train_gated_geometry_residual_fusion(args):
         "geometry_descriptor_head_state_dict": geometry_descriptor_head.state_dict(),
         "gated_residual_head_state_dict": gated_residual_head.state_dict(),
         "config": {
-            "model_type": "gated_geometry_residual_fusion",
+            "model_type": args.model_type,
             "fusion_checkpoint_path": args.fusion_checkpoint,
             "freeze_fusion_base": True,
             "qwen_hidden_dim": 3584,
@@ -528,6 +550,10 @@ def train_gated_geometry_residual_fusion(args):
             ],
             "geometry_descriptor_hidden_size": 512,
             "gated_residual_hidden_size": 512,
+            "decoder_type": decoder_type,
+            "query_decoder_dim": args.query_decoder_dim if is_query_decoder else None,
+            "query_decoder_layers": args.query_decoder_layers if is_query_decoder else None,
+            "query_decoder_heads": args.query_decoder_heads if is_query_decoder else None,
             "chunk_size": 10,
             "action_dim": 2,
             "geometry_descriptor_weight": args.geometry_descriptor_weight,
@@ -554,7 +580,14 @@ def train_gated_geometry_residual_fusion(args):
         "global_step": global_step,
         "train_history": train_history,
     }
-    ckpt_path = os.path.join(args.output_dir, "gated_geometry_residual_fusion_head.pt")
+    if is_query_decoder:
+        checkpoint["query_gated_residual_head_state_dict"] = checkpoint.pop("gated_residual_head_state_dict")
+    ckpt_name = (
+        "query_gated_geometry_residual_fusion_head.pt"
+        if is_query_decoder
+        else "gated_geometry_residual_fusion_head.pt"
+    )
+    ckpt_path = os.path.join(args.output_dir, ckpt_name)
     torch.save(checkpoint, ckpt_path)
     print(f"[GatedGeometryResidualFusionTrain] saved checkpoint: {ckpt_path}")
     return 0
@@ -772,7 +805,7 @@ def train(args):
 
 def main():
     args = parse_args()
-    if args.model_type == "gated_geometry_residual_fusion":
+    if args.model_type in ("gated_geometry_residual_fusion", "query_gated_geometry_residual_fusion"):
         return train_gated_geometry_residual_fusion(args)
     return train(args)
 

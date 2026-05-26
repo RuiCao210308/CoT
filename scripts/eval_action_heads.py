@@ -32,6 +32,7 @@ from action_head import (
     OracleGeometryFusionHead,
     PredictedGeometryFusionHead,
     PredictedGeometrySequenceFusionHead,
+    QueryGatedResidualHead,
     WaypointAuxFusionHead,
 )
 from geometry_token import (
@@ -71,6 +72,7 @@ MODEL_TYPES = (
     "curvature_only_detached_residual_geometry_sequence_fusion",
     "frozen_fusion_curvature_residual",
     "gated_geometry_residual_fusion",
+    "query_gated_geometry_residual_fusion",
 )
 
 
@@ -245,6 +247,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "curvature_only_detached_residual_geometry_sequence_fusion",
             "frozen_fusion_curvature_residual",
             "gated_geometry_residual_fusion",
+            "query_gated_geometry_residual_fusion",
         ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
@@ -265,8 +268,17 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "curvature_only_detached_residual_geometry_sequence_fusion",
             "frozen_fusion_curvature_residual",
             "gated_geometry_residual_fusion",
+            "query_gated_geometry_residual_fusion",
         )
-        if args.model_type in ("frozen_fusion_curvature_residual", "gated_geometry_residual_fusion") and args.hidden_cache:
+        if (
+            args.model_type
+            in (
+                "frozen_fusion_curvature_residual",
+                "gated_geometry_residual_fusion",
+                "query_gated_geometry_residual_fusion",
+            )
+            and args.hidden_cache
+        ):
             needs_qwen_inputs = False
         if needs_qwen_inputs:
             prompt_fields = get_prompt_fields(record)
@@ -322,7 +334,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
                 skipped["invalid_target_future_waypoints_local"] += 1
                 continue
             sample["target_waypoints"] = target_waypoints
-        elif args.model_type == "gated_geometry_residual_fusion":
+        elif args.model_type in ("gated_geometry_residual_fusion", "query_gated_geometry_residual_fusion"):
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -732,6 +744,7 @@ def load_gated_geometry_residual_fusion_modules(
 ) -> Dict[str, Any]:
     config = checkpoint.get("config", {})
     descriptor_dim = int(config.get("descriptor_dim", 6))
+    decoder_type = str(config.get("decoder_type", "mlp"))
     geometry_descriptor_head = GeometryDescriptorHead(
         qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
         descriptor_dim=descriptor_dim,
@@ -744,17 +757,32 @@ def load_gated_geometry_residual_fusion_modules(
     geometry_descriptor_head.load_state_dict(descriptor_state)
     geometry_descriptor_head.eval()
 
-    gated_residual_head = ChannelWiseGatedResidualHead(
-        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
-        descriptor_dim=descriptor_dim,
-        hidden_size=int(config.get("gated_residual_hidden_size", 512)),
-        chunk_size=int(config.get("chunk_size", 10)),
-        action_dim=int(config.get("action_dim", 2)),
-        dropout=float(config.get("dropout", 0.1)),
-    ).to(device)
-    gated_state = checkpoint.get("gated_residual_head_state_dict")
-    if gated_state is None:
-        raise KeyError("checkpoint missing gated_residual_head_state_dict")
+    if decoder_type == "query":
+        gated_residual_head = QueryGatedResidualHead(
+            qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+            descriptor_dim=descriptor_dim,
+            decoder_dim=int(config.get("query_decoder_dim", 256)),
+            num_queries=int(config.get("chunk_size", 10)),
+            action_dim=int(config.get("action_dim", 2)),
+            num_layers=int(config.get("query_decoder_layers", 1)),
+            num_heads=int(config.get("query_decoder_heads", 4)),
+            dropout=float(config.get("dropout", 0.1)),
+        ).to(device)
+        gated_state = checkpoint.get("query_gated_residual_head_state_dict")
+        if gated_state is None:
+            raise KeyError("checkpoint missing query_gated_residual_head_state_dict")
+    else:
+        gated_residual_head = ChannelWiseGatedResidualHead(
+            qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+            descriptor_dim=descriptor_dim,
+            hidden_size=int(config.get("gated_residual_hidden_size", 512)),
+            chunk_size=int(config.get("chunk_size", 10)),
+            action_dim=int(config.get("action_dim", 2)),
+            dropout=float(config.get("dropout", 0.1)),
+        ).to(device)
+        gated_state = checkpoint.get("gated_residual_head_state_dict")
+        if gated_state is None:
+            raise KeyError("checkpoint missing gated_residual_head_state_dict")
     gated_residual_head.load_state_dict(gated_state)
     gated_residual_head.eval()
 
@@ -1006,6 +1034,7 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "speed_source": sums.get("speed_source"),
         "freeze_fusion_base": sums.get("freeze_fusion_base"),
         "fusion_checkpoint_path": sums.get("fusion_checkpoint_path"),
+        "decoder_type": sums.get("decoder_type"),
         "residual_curvature_abs_mean": None,
         "residual_abs_mean": None,
         "gate_mean": None,
@@ -1126,6 +1155,7 @@ def print_summary(metrics: Dict[str, Any]):
         print(f"base_speed_mae_mps={metrics['base_speed_mae_mps']}")
         print(f"base_curvature_mae_x100={metrics['base_curvature_mae_x100']}")
     if metrics.get("residual_abs_mean") is not None:
+        print(f"decoder_type={metrics['decoder_type']}")
         print(f"residual_abs_mean={metrics['residual_abs_mean']}")
         print(f"gate_mean={metrics['gate_mean']}")
         print(f"speed_gate_mean={metrics['speed_gate_mean']}")
@@ -1647,6 +1677,7 @@ def evaluate_gated_geometry_residual_fusion(
     sums["speed_source"] = str(config.get("speed_source", "frozen_fusion_base_plus_gated_residual"))
     sums["freeze_fusion_base"] = bool(config.get("freeze_fusion_base", True))
     sums["fusion_checkpoint_path"] = str(config.get("fusion_checkpoint_path", ""))
+    sums["decoder_type"] = str(config.get("decoder_type", "mlp"))
     with torch.no_grad():
         for sample in samples:
             if hidden_cache is None:
@@ -1721,7 +1752,7 @@ def main():
             sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
         elif args.model_type == "curvature_only_detached_residual_geometry_sequence_fusion":
             sums = evaluate_curvature_only_detached_residual_geometry_sequence_fusion(args, samples, device)
-        elif args.model_type == "gated_geometry_residual_fusion":
+        elif args.model_type in ("gated_geometry_residual_fusion", "query_gated_geometry_residual_fusion"):
             sums = evaluate_gated_geometry_residual_fusion(args, samples, device)
         else:
             sums = evaluate_frozen_fusion_curvature_residual(args, samples, device)

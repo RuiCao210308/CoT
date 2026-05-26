@@ -1126,6 +1126,88 @@ class ChannelWiseGatedResidualHead(nn.Module):
         return {"residual_action": residual_action, "gate": gate}
 
 
+class QueryGatedResidualHead(nn.Module):
+    """Temporal action-query decoder for per-step residual actions and gates."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        descriptor_dim: int = 6,
+        decoder_dim: int = 256,
+        num_queries: int = 10,
+        action_dim: int = 2,
+        num_layers: int = 1,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.descriptor_dim = descriptor_dim
+        self.decoder_dim = decoder_dim
+        self.num_queries = num_queries
+        self.chunk_size = num_queries
+        self.action_dim = action_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+
+        self.planning_token = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, decoder_dim),
+            nn.GELU(),
+        )
+        self.geometry_token = nn.Sequential(
+            nn.LayerNorm(descriptor_dim),
+            nn.Linear(descriptor_dim, decoder_dim),
+            nn.GELU(),
+        )
+        self.action_queries = nn.Parameter(torch.randn(num_queries, decoder_dim) * 0.02)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=decoder_dim,
+            nhead=num_heads,
+            dim_feedforward=decoder_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.output_norm = nn.LayerNorm(decoder_dim)
+        self.residual_out = nn.Linear(decoder_dim, action_dim)
+        self.gate_out = nn.Linear(decoder_dim, action_dim)
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        geometry_descriptor: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, got {planning_hidden.shape[-1]}."
+            )
+        if geometry_descriptor.ndim != 2:
+            raise ValueError("geometry_descriptor must have shape [B, descriptor_dim].")
+        if geometry_descriptor.shape[-1] != self.descriptor_dim:
+            raise ValueError(
+                f"geometry_descriptor last dim must be {self.descriptor_dim}, "
+                f"got {geometry_descriptor.shape[-1]}."
+            )
+        if planning_hidden.shape[0] != geometry_descriptor.shape[0]:
+            raise ValueError("planning_hidden and geometry_descriptor must have the same batch size.")
+
+        batch_size = planning_hidden.shape[0]
+        planning_token = self.planning_token(planning_hidden).unsqueeze(1)
+        geometry_token = self.geometry_token(geometry_descriptor).unsqueeze(1)
+        memory = torch.cat([planning_token, geometry_token], dim=1)
+        queries = self.action_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        decoded = self.decoder(tgt=queries, memory=memory)
+        decoded = self.output_norm(decoded)
+        residual_action = self.residual_out(decoded)
+        gate = torch.sigmoid(self.gate_out(decoded))
+        return {"residual_action": residual_action, "gate": gate}
+
+
 class GatedGeometryResidualFusionHead(nn.Module):
     """Frozen Fusion base action with descriptor-conditioned channel-wise gated residuals."""
 
