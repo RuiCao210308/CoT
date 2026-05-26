@@ -18,6 +18,7 @@ if PLANNER_DIR not in sys.path:
     sys.path.insert(0, PLANNER_DIR)
 
 from action_head import (
+    ChannelWiseGatedResidualHead,
     ContinuousActionHead,
     CurvatureResidualHead,
     CurvatureOnlyDetachedResidualGeometrySequenceFusionHead,
@@ -26,6 +27,8 @@ from action_head import (
     EgoOnlyActionHead,
     FrozenFusionCurvatureResidualHead,
     FusionActionHead,
+    GatedGeometryResidualFusionHead,
+    GeometryDescriptorHead,
     OracleGeometryFusionHead,
     PredictedGeometryFusionHead,
     PredictedGeometrySequenceFusionHead,
@@ -67,6 +70,7 @@ MODEL_TYPES = (
     "detached_residual_geometry_sequence_fusion",
     "curvature_only_detached_residual_geometry_sequence_fusion",
     "frozen_fusion_curvature_residual",
+    "gated_geometry_residual_fusion",
 )
 
 
@@ -161,6 +165,34 @@ def make_waypoint_target(record: Dict[str, Any]) -> Optional[torch.Tensor]:
     return waypoints.unsqueeze(0)
 
 
+def geometry_descriptor_from_waypoints(waypoints: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if waypoints.ndim != 3 or waypoints.shape[1:] != (10, 2):
+        raise ValueError(f"waypoints must have shape [B,10,2], got {tuple(waypoints.shape)}")
+    origin = torch.zeros(waypoints.shape[0], 1, 2, dtype=waypoints.dtype, device=waypoints.device)
+    points = torch.cat([origin, waypoints], dim=1)
+    deltas = points[:, 1:] - points[:, :-1]
+    segment_lengths = torch.linalg.norm(deltas, dim=-1)
+    path_length = segment_lengths.sum(dim=1)
+    headings = torch.atan2(deltas[..., 1], deltas[..., 0])
+    heading_deltas = torch.atan2(torch.sin(headings[:, 1:] - headings[:, :-1]), torch.cos(headings[:, 1:] - headings[:, :-1]))
+    signed_curvature = heading_deltas / segment_lengths[:, 1:].clamp_min(eps)
+    mean_signed_curvature = signed_curvature.mean(dim=1)
+    heading_change = torch.atan2(torch.sin(headings[:, -1] - headings[:, 0]), torch.cos(headings[:, -1] - headings[:, 0]))
+    endpoint = waypoints[:, -1]
+    max_abs_lateral_offset = torch.max(torch.abs(waypoints[..., 1]), dim=1).values
+    return torch.stack(
+        [
+            endpoint[:, 0],
+            endpoint[:, 1],
+            path_length,
+            mean_signed_curvature,
+            max_abs_lateral_offset,
+            heading_change,
+        ],
+        dim=-1,
+    )
+
+
 def get_prompt_fields(record: Dict[str, Any]) -> Optional[Dict[str, str]]:
     input_section = record.get("input", {})
     system_message = input_section.get("system_message")
@@ -212,6 +244,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "detached_residual_geometry_sequence_fusion",
             "curvature_only_detached_residual_geometry_sequence_fusion",
             "frozen_fusion_curvature_residual",
+            "gated_geometry_residual_fusion",
         ):
             ego_history = tensor_or_none(record.get("input", {}).get("ego_history_array"), (10, 3))
             if ego_history is None:
@@ -231,8 +264,9 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "detached_residual_geometry_sequence_fusion",
             "curvature_only_detached_residual_geometry_sequence_fusion",
             "frozen_fusion_curvature_residual",
+            "gated_geometry_residual_fusion",
         )
-        if args.model_type == "frozen_fusion_curvature_residual" and args.hidden_cache:
+        if args.model_type in ("frozen_fusion_curvature_residual", "gated_geometry_residual_fusion") and args.hidden_cache:
             needs_qwen_inputs = False
         if needs_qwen_inputs:
             prompt_fields = get_prompt_fields(record)
@@ -283,6 +317,12 @@ def collect_samples(records: List[Dict[str, Any]], args):
                 continue
             sample["target_waypoints"] = target_waypoints
         elif args.model_type == "frozen_fusion_curvature_residual":
+            target_waypoints = make_waypoint_target(record)
+            if target_waypoints is None:
+                skipped["invalid_target_future_waypoints_local"] += 1
+                continue
+            sample["target_waypoints"] = target_waypoints
+        elif args.model_type == "gated_geometry_residual_fusion":
             target_waypoints = make_waypoint_target(record)
             if target_waypoints is None:
                 skipped["invalid_target_future_waypoints_local"] += 1
@@ -686,6 +726,58 @@ def load_frozen_fusion_curvature_residual_modules(
     }
 
 
+def load_gated_geometry_residual_fusion_modules(
+    checkpoint: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    config = checkpoint.get("config", {})
+    descriptor_dim = int(config.get("descriptor_dim", 6))
+    geometry_descriptor_head = GeometryDescriptorHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        descriptor_dim=descriptor_dim,
+        hidden_size=int(config.get("geometry_descriptor_hidden_size", 512)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    descriptor_state = checkpoint.get("geometry_descriptor_head_state_dict")
+    if descriptor_state is None:
+        raise KeyError("checkpoint missing geometry_descriptor_head_state_dict")
+    geometry_descriptor_head.load_state_dict(descriptor_state)
+    geometry_descriptor_head.eval()
+
+    gated_residual_head = ChannelWiseGatedResidualHead(
+        qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
+        descriptor_dim=descriptor_dim,
+        hidden_size=int(config.get("gated_residual_hidden_size", 512)),
+        chunk_size=int(config.get("chunk_size", 10)),
+        action_dim=int(config.get("action_dim", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    gated_state = checkpoint.get("gated_residual_head_state_dict")
+    if gated_state is None:
+        raise KeyError("checkpoint missing gated_residual_head_state_dict")
+    gated_residual_head.load_state_dict(gated_state)
+    gated_residual_head.eval()
+
+    fusion_checkpoint_path = config.get("fusion_checkpoint_path")
+    if not fusion_checkpoint_path:
+        raise KeyError("checkpoint config missing fusion_checkpoint_path")
+    fusion_checkpoint = load_checkpoint(str(fusion_checkpoint_path), device)
+    frozen_fusion_head = load_fusion_head(fusion_checkpoint, device)
+    head = GatedGeometryResidualFusionHead(
+        frozen_fusion_head=frozen_fusion_head,
+        geometry_descriptor_head=geometry_descriptor_head,
+        gated_residual_head=gated_residual_head,
+        residual_scale=float(config.get("residual_scale", 0.1)),
+    ).to(device)
+    head.eval()
+    return {
+        "head": head,
+        "geometry_descriptor_head": geometry_descriptor_head,
+        "gated_residual_head": gated_residual_head,
+        "config": config,
+    }
+
+
 def resolve_consistency_dt(args, checkpoint: Dict[str, Any]) -> float:
     if args.dt is not None:
         return float(args.dt)
@@ -834,6 +926,35 @@ def update_curvature_only_residual_metric_sums(
     sums["base_points"] += int(base_action.shape[0] * base_action.shape[1])
 
 
+def update_gated_residual_metric_sums(
+    sums: Dict[str, float],
+    outputs: Dict[str, torch.Tensor],
+    target_train: torch.Tensor,
+    target_descriptor: torch.Tensor,
+):
+    residual_action = outputs["residual_action"].detach().float().cpu()
+    gate = outputs["gate"].detach().float().cpu()
+    base_action = outputs["base_action"].detach().float().cpu()
+    descriptor = outputs["geometry_descriptor"].detach().float().cpu()
+    target_train = target_train.detach().float().cpu()
+    target_descriptor = target_descriptor.detach().float().cpu()
+    target_physical = pred_to_physical(target_train)
+    base_physical = pred_to_physical(base_action)
+
+    sums["residual_abs_sum"] += float(torch.abs(residual_action).sum())
+    sums["residual_values"] += int(residual_action.numel())
+    sums["gate_sum"] += float(gate.sum())
+    sums["gate_values"] += int(gate.numel())
+    sums["speed_gate_sum"] += float(gate[..., 0].sum())
+    sums["curvature_gate_sum"] += float(gate[..., 1].sum())
+    sums["gate_points"] += int(gate.shape[0] * gate.shape[1])
+    sums["base_speed_abs"] += float(torch.abs(base_physical[..., 0] - target_physical[..., 0]).sum())
+    sums["base_curvature_abs_x100"] += float(torch.abs(base_action[..., 1] - target_train[..., 1]).sum())
+    sums["base_points"] += int(base_action.shape[0] * base_action.shape[1])
+    sums["geometry_descriptor_l1_sum"] += float(torch.abs(descriptor - target_descriptor).sum())
+    sums["geometry_descriptor_values"] += int(descriptor.numel())
+
+
 def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str, float]) -> Dict[str, Any]:
     num_points = int(sums["points"])
     num_action_values = int(sums["action_values"])
@@ -886,8 +1007,14 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "freeze_fusion_base": sums.get("freeze_fusion_base"),
         "fusion_checkpoint_path": sums.get("fusion_checkpoint_path"),
         "residual_curvature_abs_mean": None,
+        "residual_abs_mean": None,
+        "gate_mean": None,
+        "speed_gate_mean": None,
+        "curvature_gate_mean": None,
         "base_speed_mae_mps": None,
         "base_curvature_mae_x100": None,
+        "base_speed_mae": None,
+        "base_curvature_mae": None,
     }
     if num_points == 0:
         return metrics
@@ -930,10 +1057,21 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
     residual_curvature_values = int(sums["residual_curvature_values"])
     if residual_curvature_values > 0:
         metrics["residual_curvature_abs_mean"] = sums["residual_curvature_abs_sum"] / residual_curvature_values
+    residual_values = int(sums["residual_values"])
+    if residual_values > 0:
+        metrics["residual_abs_mean"] = sums["residual_abs_sum"] / residual_values
+    gate_values = int(sums["gate_values"])
+    gate_points = int(sums["gate_points"])
+    if gate_values > 0 and gate_points > 0:
+        metrics["gate_mean"] = sums["gate_sum"] / gate_values
+        metrics["speed_gate_mean"] = sums["speed_gate_sum"] / gate_points
+        metrics["curvature_gate_mean"] = sums["curvature_gate_sum"] / gate_points
     base_points = int(sums["base_points"])
     if base_points > 0:
         metrics["base_speed_mae_mps"] = sums["base_speed_abs"] / base_points
         metrics["base_curvature_mae_x100"] = sums["base_curvature_abs_x100"] / base_points
+        metrics["base_speed_mae"] = metrics["base_speed_mae_mps"]
+        metrics["base_curvature_mae"] = metrics["base_curvature_mae_x100"]
     return metrics
 
 
@@ -985,6 +1123,13 @@ def print_summary(metrics: Dict[str, Any]):
         print(f"fusion_checkpoint_path={metrics['fusion_checkpoint_path']}")
     if metrics.get("residual_curvature_abs_mean") is not None:
         print(f"residual_curvature_abs_mean={metrics['residual_curvature_abs_mean']}")
+        print(f"base_speed_mae_mps={metrics['base_speed_mae_mps']}")
+        print(f"base_curvature_mae_x100={metrics['base_curvature_mae_x100']}")
+    if metrics.get("residual_abs_mean") is not None:
+        print(f"residual_abs_mean={metrics['residual_abs_mean']}")
+        print(f"gate_mean={metrics['gate_mean']}")
+        print(f"speed_gate_mean={metrics['speed_gate_mean']}")
+        print(f"curvature_gate_mean={metrics['curvature_gate_mean']}")
         print(f"base_speed_mae_mps={metrics['base_speed_mae_mps']}")
         print(f"base_curvature_mae_x100={metrics['base_curvature_mae_x100']}")
 
@@ -1479,6 +1624,57 @@ def evaluate_frozen_fusion_curvature_residual(
     return sums
 
 
+def evaluate_gated_geometry_residual_fusion(
+    args,
+    samples: List[Dict[str, Any]],
+    device: torch.device,
+):
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    modules = load_gated_geometry_residual_fusion_modules(checkpoint, device)
+    head = modules["head"]
+    config = modules["config"]
+    hidden_cache = load_hidden_cache(args.hidden_cache)
+    if hidden_cache is None:
+        qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    else:
+        qwen_model, processor = None, None
+        print(f"[EvalActionHead] using_hidden_cache={args.hidden_cache} num_cached={hidden_cache.get('num_cached')}")
+    sums = Counter()
+    sums["geometry_descriptor_dim"] = int(config.get("descriptor_dim", 6))
+    sums["residual_scale"] = float(config.get("residual_scale", 0.1))
+    sums["detach_geometry_for_action"] = bool(config.get("detach_geometry_for_action", True))
+    sums["residual_target"] = str(config.get("residual_target", "speed_and_curvature_channelwise_gated"))
+    sums["speed_source"] = str(config.get("speed_source", "frozen_fusion_base_plus_gated_residual"))
+    sums["freeze_fusion_base"] = bool(config.get("freeze_fusion_base", True))
+    sums["fusion_checkpoint_path"] = str(config.get("fusion_checkpoint_path", ""))
+    with torch.no_grad():
+        for sample in samples:
+            if hidden_cache is None:
+                inputs = build_qwen_inputs(
+                    prompt=sample["planning_prompt"],
+                    images=sample["image_path"],
+                    processor=processor,
+                    model=qwen_model,
+                    args=args,
+                    get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+                )
+                last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+                planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            else:
+                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
+            planning_hidden = planning_hidden.to(device=device, dtype=next(head.geometry_descriptor_head.parameters()).dtype)
+            ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            outputs = head(planning_hidden, ego_history, detach_geometry=True)
+            pred_train = outputs["action_chunk"]
+            target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
+            target_waypoints = sample["target_waypoints"].to(device=device, dtype=pred_train.dtype)
+            target_descriptor = geometry_descriptor_from_waypoints(target_waypoints)
+            update_metric_sums(sums, pred_train, target_train)
+            update_gated_residual_metric_sums(sums, outputs, target_train, target_descriptor)
+            write_eval_record(args, sample, pred_train, target_train, target_waypoints)
+    return sums
+
+
 def main():
     args = parse_args()
     records, skipped = load_jsonl_records(args.jsonl)
@@ -1525,6 +1721,8 @@ def main():
             sums = evaluate_detached_residual_geometry_sequence_fusion(args, samples, device)
         elif args.model_type == "curvature_only_detached_residual_geometry_sequence_fusion":
             sums = evaluate_curvature_only_detached_residual_geometry_sequence_fusion(args, samples, device)
+        elif args.model_type == "gated_geometry_residual_fusion":
+            sums = evaluate_gated_geometry_residual_fusion(args, samples, device)
         else:
             sums = evaluate_frozen_fusion_curvature_residual(args, samples, device)
     finally:

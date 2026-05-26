@@ -1034,6 +1034,140 @@ class FrozenFusionCurvatureResidualHead(nn.Module):
         }
 
 
+class GeometryDescriptorHead(nn.Module):
+    """Predict a compact trajectory geometry descriptor from the planning hidden state."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        descriptor_dim: int = 6,
+        hidden_size: int = 512,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.descriptor_dim = descriptor_dim
+        self.hidden_size = hidden_size
+        self.net = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim),
+            nn.Linear(qwen_hidden_dim, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, descriptor_dim),
+        )
+
+    def forward(self, planning_hidden: torch.Tensor) -> torch.Tensor:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, got {planning_hidden.shape[-1]}."
+            )
+        return self.net(planning_hidden)
+
+
+class ChannelWiseGatedResidualHead(nn.Module):
+    """Predict per-channel residual actions and gates from hidden state plus geometry descriptor."""
+
+    def __init__(
+        self,
+        qwen_hidden_dim: int = 3584,
+        descriptor_dim: int = 6,
+        hidden_size: int = 512,
+        chunk_size: int = 10,
+        action_dim: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.qwen_hidden_dim = qwen_hidden_dim
+        self.descriptor_dim = descriptor_dim
+        self.hidden_size = hidden_size
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(qwen_hidden_dim + descriptor_dim),
+            nn.Linear(qwen_hidden_dim + descriptor_dim, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.residual_out = nn.Linear(hidden_size, chunk_size * action_dim)
+        self.gate_out = nn.Linear(hidden_size, chunk_size * action_dim)
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        geometry_descriptor: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if planning_hidden.ndim != 2:
+            raise ValueError("planning_hidden must have shape [B, qwen_hidden_dim].")
+        if planning_hidden.shape[-1] != self.qwen_hidden_dim:
+            raise ValueError(
+                f"planning_hidden last dim must be {self.qwen_hidden_dim}, got {planning_hidden.shape[-1]}."
+            )
+        if geometry_descriptor.ndim != 2:
+            raise ValueError("geometry_descriptor must have shape [B, descriptor_dim].")
+        if geometry_descriptor.shape[-1] != self.descriptor_dim:
+            raise ValueError(
+                f"geometry_descriptor last dim must be {self.descriptor_dim}, "
+                f"got {geometry_descriptor.shape[-1]}."
+            )
+        if planning_hidden.shape[0] != geometry_descriptor.shape[0]:
+            raise ValueError("planning_hidden and geometry_descriptor must have the same batch size.")
+
+        features = self.trunk(torch.cat([planning_hidden, geometry_descriptor], dim=-1))
+        residual_action = self.residual_out(features).view(-1, self.chunk_size, self.action_dim)
+        gate = torch.sigmoid(self.gate_out(features).view(-1, self.chunk_size, self.action_dim))
+        return {"residual_action": residual_action, "gate": gate}
+
+
+class GatedGeometryResidualFusionHead(nn.Module):
+    """Frozen Fusion base action with descriptor-conditioned channel-wise gated residuals."""
+
+    def __init__(
+        self,
+        frozen_fusion_head: FusionActionHead,
+        geometry_descriptor_head: GeometryDescriptorHead,
+        gated_residual_head: ChannelWiseGatedResidualHead,
+        residual_scale: float = 0.1,
+    ):
+        super().__init__()
+        self.frozen_fusion_head = frozen_fusion_head
+        self.geometry_descriptor_head = geometry_descriptor_head
+        self.gated_residual_head = gated_residual_head
+        self.residual_scale = residual_scale
+        for parameter in self.frozen_fusion_head.parameters():
+            parameter.requires_grad = False
+        self.frozen_fusion_head.eval()
+
+    def forward(
+        self,
+        planning_hidden: torch.Tensor,
+        ego_history_array: torch.Tensor,
+        detach_geometry: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            base_action = self.frozen_fusion_head(planning_hidden, ego_history_array)
+        geometry_descriptor = self.geometry_descriptor_head(planning_hidden)
+        descriptor_for_action = geometry_descriptor.detach() if detach_geometry else geometry_descriptor
+        residual_outputs = self.gated_residual_head(planning_hidden, descriptor_for_action)
+        residual_action = residual_outputs["residual_action"]
+        gate = residual_outputs["gate"]
+        action_chunk = base_action + self.residual_scale * gate * residual_action
+        return {
+            "action_chunk": action_chunk,
+            "base_action": base_action,
+            "geometry_descriptor": geometry_descriptor,
+            "residual_action": residual_action,
+            "gate": gate,
+        }
+
+
 def build_continuous_action_head(
     hidden_dim: int = 3584,
     chunk_size: int = 10,
