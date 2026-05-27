@@ -26,6 +26,7 @@ from qwen_planner import (
 
 TRAIN_ACTION_SCHEMA = ["speed_mps", "curvature_x100"]
 SOURCE_ACTION_SCHEMA = ["speed_mps", "curvature_1pm"]
+EXPECTED_QWEN_HIDDEN_DIM = 3584
 DEFAULT_QWEN_LOCAL_ID = (
     "/home/Cr_seu0321/.cache/huggingface/hub/"
     "models--Qwen--Qwen2-VL-7B-Instruct/snapshots/"
@@ -46,6 +47,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--speed_weight", type=float, default=1.0)
     parser.add_argument("--curvature_weight", type=float, default=1.0)
+    parser.add_argument("--hidden_cache", type=str, default=None)
     return parser.parse_args()
 
 
@@ -99,33 +101,71 @@ def make_train_target(record: Dict[str, Any]) -> Optional[torch.Tensor]:
     return tensor.unsqueeze(0)
 
 
-def collect_samples(records: List[Dict[str, Any]], dataroot: str, max_samples: int):
+def collect_samples(records: List[Dict[str, Any]], dataroot: str, max_samples: int, use_hidden_cache: bool = False):
     samples = []
     skipped = Counter()
-    for record in records:
+    for record_index, record in enumerate(records):
         if max_samples > 0 and len(samples) >= max_samples:
             break
         target = make_train_target(record)
         if target is None:
             skipped["invalid_target_future_action_gt"] += 1
             continue
-        image_path = resolve_image_path(record, dataroot)
-        if image_path is None:
-            skipped["missing_image_path"] += 1
-            continue
-        prompt = get_planning_prompt(record)
-        if prompt is None:
-            skipped["missing_input_planning_prompt"] += 1
-            continue
-        samples.append(
-            {
-                "record": record,
-                "image_path": image_path,
-                "planning_prompt": prompt,
-                "target": target,
-            }
-        )
+        sample = {
+            "record": record,
+            "record_index": record_index,
+            "target": target,
+        }
+        if not use_hidden_cache:
+            image_path = resolve_image_path(record, dataroot)
+            if image_path is None:
+                skipped["missing_image_path"] += 1
+                continue
+            prompt = get_planning_prompt(record)
+            if prompt is None:
+                skipped["missing_input_planning_prompt"] += 1
+                continue
+            sample["image_path"] = image_path
+            sample["planning_prompt"] = prompt
+        samples.append(sample)
     return samples, skipped
+
+
+def load_hidden_cache(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    cache = torch.load(path, map_location="cpu")
+    if cache.get("format") != "openemma_qwen_planning_hidden_cache_v1":
+        raise ValueError(f"unsupported hidden cache format: {cache.get('format')}")
+    if "hidden" not in cache or "record_to_hidden_index" not in cache:
+        raise KeyError("hidden cache must contain hidden and record_to_hidden_index")
+    hidden = cache["hidden"]
+    if not isinstance(hidden, torch.Tensor):
+        raise TypeError("hidden cache field 'hidden' must be a torch.Tensor")
+    if hidden.ndim != 2 or hidden.shape[1] != EXPECTED_QWEN_HIDDEN_DIM:
+        raise ValueError(
+            f"hidden cache tensor must have shape [N,{EXPECTED_QWEN_HIDDEN_DIM}], got {tuple(hidden.shape)}"
+        )
+    mapping = cache["record_to_hidden_index"]
+    if not isinstance(mapping, dict):
+        raise TypeError("hidden cache field 'record_to_hidden_index' must be a dict")
+    return cache
+
+
+def cached_planning_hidden(cache: Dict[str, Any], record_index: int) -> torch.Tensor:
+    mapping = cache.get("record_to_hidden_index", {})
+    hidden_index = mapping.get(record_index)
+    if hidden_index is None:
+        hidden_index = mapping.get(str(record_index))
+    if hidden_index is None:
+        raise KeyError(f"hidden cache missing record_index={record_index}")
+    hidden = cache["hidden"][int(hidden_index)]
+    if hidden.shape != (EXPECTED_QWEN_HIDDEN_DIM,):
+        raise ValueError(
+            f"hidden cache row for record_index={record_index} must have shape "
+            f"({EXPECTED_QWEN_HIDDEN_DIM},), got {tuple(hidden.shape)}"
+        )
+    return hidden.unsqueeze(0)
 
 
 def resolve_qwen_model_path(model_path: str) -> str:
@@ -155,16 +195,32 @@ def load_qwen_model_and_processor(model_path: str, device: str):
 def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
     records = load_jsonl_records(args.jsonl)
-    samples, skipped = collect_samples(records, args.dataroot, args.max_samples)
+    hidden_cache = load_hidden_cache(args.hidden_cache)
+    samples, skipped = collect_samples(
+        records,
+        args.dataroot,
+        args.max_samples,
+        use_hidden_cache=hidden_cache is not None,
+    )
     print(f"[ActionHeadTrain] loaded_records={len(records)} usable_samples={len(samples)} skipped={sum(skipped.values())}")
     if skipped:
         print(f"[ActionHeadTrain] skipped_reasons={dict(skipped)}")
     if not samples:
-        print("[ActionHeadTrain] no usable samples. Need metadata.image_path and input.planning_prompt in JSONL.")
+        if hidden_cache is None:
+            print("[ActionHeadTrain] no usable samples. Need metadata.image_path and input.planning_prompt in JSONL.")
+        else:
+            print("[ActionHeadTrain] no usable samples. Need valid target.future_action_gt records.")
         return 1
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    if hidden_cache is None:
+        qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    else:
+        qwen_model, processor = None, None
+        print(
+            f"[ActionHeadTrain] using_hidden_cache={args.hidden_cache} "
+            f"num_cached={hidden_cache.get('num_cached')}"
+        )
     action_head = ContinuousActionHead(hidden_dim=3584, chunk_size=10, action_dim=2).to(device)
     optimizer = torch.optim.AdamW(action_head.parameters(), lr=args.lr)
 
@@ -185,16 +241,19 @@ def train(args):
         epoch_curvature_l1 = 0.0
         epoch_samples = 0
         for sample in samples:
-            inputs = build_qwen_inputs(
-                prompt=sample["planning_prompt"],
-                images=sample["image_path"],
-                processor=processor,
-                model=qwen_model,
-                args=args,
-            )
-            with torch.no_grad():
-                last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
-                planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            if hidden_cache is None:
+                inputs = build_qwen_inputs(
+                    prompt=sample["planning_prompt"],
+                    images=sample["image_path"],
+                    processor=processor,
+                    model=qwen_model,
+                    args=args,
+                )
+                with torch.no_grad():
+                    last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+                    planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            else:
+                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
             planning_hidden = planning_hidden.to(device=device, dtype=next(action_head.parameters()).dtype)
 
             pred = action_head(planning_hidden)
@@ -251,6 +310,7 @@ def train(args):
             "speed_weight": args.speed_weight,
             "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
+            "hidden_cache": args.hidden_cache,
         },
         "train_action_schema": TRAIN_ACTION_SCHEMA,
         "source_action_schema": SOURCE_ACTION_SCHEMA,
