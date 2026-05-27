@@ -22,7 +22,7 @@ from qwen_planner import (
     extract_qwen_hidden_states,
     select_planning_hidden,
 )
-from train_action_head import load_qwen_model_and_processor
+from train_action_head import cached_planning_hidden, load_hidden_cache, load_qwen_model_and_processor
 
 
 SOURCE_ACTION_SCHEMA = ["speed_mps", "curvature_1pm"]
@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--speed_weight", type=float, default=1.0)
     parser.add_argument("--curvature_weight", type=float, default=1.0)
+    parser.add_argument("--hidden_cache", type=str, default=None)
     return parser.parse_args()
 
 
@@ -116,10 +117,10 @@ def get_prompt_fields(record: Dict[str, Any]) -> Optional[Dict[str, str]]:
     return {"system_message": system_message, "planning_prompt": planning_prompt}
 
 
-def collect_samples(records: List[Dict[str, Any]], args):
+def collect_samples(records: List[Dict[str, Any]], args, use_hidden_cache: bool = False):
     samples = []
     skipped = Counter()
-    for record in records:
+    for record_index, record in enumerate(records):
         if args.max_samples > 0 and len(samples) >= args.max_samples:
             break
 
@@ -131,25 +132,26 @@ def collect_samples(records: List[Dict[str, Any]], args):
         if ego_history is None:
             skipped["invalid_input_ego_history_array"] += 1
             continue
-        prompt_fields = get_prompt_fields(record)
-        if prompt_fields is None:
-            skipped["missing_input_system_or_planning_prompt"] += 1
-            continue
-        image_path = resolve_image_path(record, args.dataroot)
-        if image_path is None:
-            skipped["missing_image_path"] += 1
-            continue
+        sample = {
+            "record_index": record_index,
+            "line_no": record.get("_line_no"),
+            "ego_history": ego_history.unsqueeze(0),
+            "target": target,
+        }
+        if not use_hidden_cache:
+            prompt_fields = get_prompt_fields(record)
+            if prompt_fields is None:
+                skipped["missing_input_system_or_planning_prompt"] += 1
+                continue
+            image_path = resolve_image_path(record, args.dataroot)
+            if image_path is None:
+                skipped["missing_image_path"] += 1
+                continue
+            sample["image_path"] = image_path
+            sample["system_message"] = prompt_fields["system_message"]
+            sample["planning_prompt"] = prompt_fields["planning_prompt"]
 
-        samples.append(
-            {
-                "line_no": record.get("_line_no"),
-                "image_path": image_path,
-                "system_message": prompt_fields["system_message"],
-                "planning_prompt": prompt_fields["planning_prompt"],
-                "ego_history": ego_history.unsqueeze(0),
-                "target": target,
-            }
-        )
+        samples.append(sample)
     return samples, skipped
 
 
@@ -175,7 +177,8 @@ def train(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
     records, skipped = load_jsonl_records(args.jsonl)
-    samples, sample_skipped = collect_samples(records, args)
+    hidden_cache = load_hidden_cache(args.hidden_cache)
+    samples, sample_skipped = collect_samples(records, args, use_hidden_cache=hidden_cache is not None)
     skipped.update(sample_skipped)
     print(
         f"[FusionHeadTrain] loaded_records={len(records)} usable_samples={len(samples)} "
@@ -195,7 +198,15 @@ def train(args):
         return 1
 
     device = resolve_device(args.device)
-    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    if hidden_cache is None:
+        qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    else:
+        qwen_model, processor = None, None
+        print(
+            f"[FusionHeadTrain] using_hidden_cache={args.hidden_cache} "
+            f"num_cached={hidden_cache.get('num_cached')}"
+        )
+        print("[FusionHeadTrain] hidden cache mode: Qwen model will not be loaded")
     fusion_head = FusionActionHead(
         qwen_hidden_dim=3584,
         history_steps=10,
@@ -218,17 +229,20 @@ def train(args):
         epoch_steps = 0
 
         for sample in samples:
-            inputs = build_qwen_inputs(
-                prompt=sample["planning_prompt"],
-                images=sample["image_path"],
-                processor=processor,
-                model=qwen_model,
-                args=args,
-                get_message_fn=qwen_train_message_builder(sample["system_message"]),
-            )
-            with torch.no_grad():
-                last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
-                planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            if hidden_cache is None:
+                inputs = build_qwen_inputs(
+                    prompt=sample["planning_prompt"],
+                    images=sample["image_path"],
+                    processor=processor,
+                    model=qwen_model,
+                    args=args,
+                    get_message_fn=qwen_train_message_builder(sample["system_message"]),
+                )
+                with torch.no_grad():
+                    last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+                    planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            else:
+                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
             planning_hidden = planning_hidden.to(device=device, dtype=next(fusion_head.parameters()).dtype)
             ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
             target = sample["target"].to(device=device, dtype=planning_hidden.dtype)
@@ -292,6 +306,7 @@ def train(args):
             "speed_weight": args.speed_weight,
             "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
+            "hidden_cache": args.hidden_cache,
         },
         "source_action_schema": SOURCE_ACTION_SCHEMA,
         "train_action_schema": TRAIN_ACTION_SCHEMA,
