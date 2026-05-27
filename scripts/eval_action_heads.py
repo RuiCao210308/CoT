@@ -76,6 +76,18 @@ MODEL_TYPES = (
 )
 
 
+class QwenHiddenHeadFusionAdapter(torch.nn.Module):
+    """Adapter for legacy qwen-hidden checkpoints evaluated with model_type=fusion."""
+
+    def __init__(self, action_head: ContinuousActionHead):
+        super().__init__()
+        self.action_head = action_head
+
+    def forward(self, planning_hidden: torch.Tensor, ego_history_array: torch.Tensor) -> torch.Tensor:
+        del ego_history_array
+        return self.action_head(planning_hidden)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate OpenEMMA OFT-lite action heads.")
     parser.add_argument("--jsonl", required=True, help="Path to stable GT action chunk JSONL.")
@@ -418,8 +430,59 @@ def load_qwen_hidden_head(checkpoint: Dict[str, Any], device: torch.device) -> C
     return head
 
 
-def load_fusion_head(checkpoint: Dict[str, Any], device: torch.device) -> FusionActionHead:
+def _state_dict_from_checkpoint(checkpoint: Dict[str, Any], canonical_key: str):
+    if canonical_key in checkpoint:
+        return checkpoint[canonical_key], canonical_key, False
+    for key in ("model_state_dict", "action_head_state_dict", "state_dict"):
+        if key in checkpoint:
+            return checkpoint[key], key, True
+    if checkpoint and all(isinstance(key, str) for key in checkpoint.keys()):
+        tensor_values = [value for value in checkpoint.values() if isinstance(value, torch.Tensor)]
+        if tensor_values and len(tensor_values) == len(checkpoint):
+            return checkpoint, "<direct_state_dict>", True
+    return None, None, False
+
+
+def _is_continuous_action_head_state_dict(state_dict: Dict[str, Any]) -> bool:
+    return any(key.startswith("net.") for key in state_dict.keys())
+
+
+def _is_fusion_action_head_state_dict(state_dict: Dict[str, Any]) -> bool:
+    return any(
+        key.startswith(prefix)
+        for key in state_dict.keys()
+        for prefix in ("ego_encoder.", "qwen_projection.", "fusion.")
+    )
+
+
+def load_fusion_head(checkpoint: Dict[str, Any], device: torch.device) -> torch.nn.Module:
     config = checkpoint.get("config", {})
+    state_dict, state_key, is_legacy = _state_dict_from_checkpoint(checkpoint, "fusion_action_head_state_dict")
+    if state_dict is None:
+        raise KeyError(
+            "checkpoint missing fusion_action_head_state_dict, model_state_dict, "
+            "action_head_state_dict, or state_dict"
+        )
+    if is_legacy:
+        print(f"[EvalActionHead] warning: using legacy fusion checkpoint format key={state_key}")
+
+    if _is_continuous_action_head_state_dict(state_dict) and not _is_fusion_action_head_state_dict(state_dict):
+        print(
+            "[EvalActionHead] warning: legacy action_head_state_dict is a qwen-hidden "
+            "ContinuousActionHead; evaluating it through fusion adapter and ignoring ego_history."
+        )
+        action_head = ContinuousActionHead(
+            hidden_dim=int(config.get("hidden_dim", config.get("qwen_hidden_dim", 3584))),
+            chunk_size=int(config.get("chunk_size", 10)),
+            action_dim=int(config.get("action_dim", 2)),
+            hidden_size=int(config.get("hidden_size", 1024)),
+            dropout=float(config.get("dropout", 0.1)),
+        ).to(device)
+        action_head.load_state_dict(state_dict)
+        head = QwenHiddenHeadFusionAdapter(action_head).to(device)
+        head.eval()
+        return head
+
     head = FusionActionHead(
         qwen_hidden_dim=int(config.get("qwen_hidden_dim", 3584)),
         history_steps=int(config.get("history_steps", 10)),
@@ -431,9 +494,6 @@ def load_fusion_head(checkpoint: Dict[str, Any], device: torch.device) -> Fusion
         action_dim=int(config.get("action_dim", 2)),
         dropout=float(config.get("dropout", 0.1)),
     ).to(device)
-    state_dict = checkpoint.get("fusion_action_head_state_dict") or checkpoint.get("state_dict")
-    if state_dict is None:
-        raise KeyError("checkpoint missing fusion_action_head_state_dict")
     head.load_state_dict(state_dict)
     head.eval()
     return head
