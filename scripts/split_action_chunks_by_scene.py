@@ -56,11 +56,14 @@ def build_summary(
     train_ratio: float,
     seed: int,
 ) -> Dict[str, Any]:
+    overlap = sorted(set(train_scenes) & set(test_scenes))
     return {
         "total_records": total_records,
         "total_scenes": len(scenes),
         "train_scenes": len(train_scenes),
         "test_scenes": len(test_scenes),
+        "scene_overlap_count": len(overlap),
+        "scene_overlap_names": overlap,
         "train_records": train_records,
         "test_records": test_records,
         "train_ratio_requested": train_ratio,
@@ -69,6 +72,8 @@ def build_summary(
         "seed": seed,
         "train_scene_names": train_scenes[:20],
         "test_scene_names": test_scenes[:20],
+        "train_scene_names_all": train_scenes,
+        "test_scene_names_all": test_scenes,
     }
 
 

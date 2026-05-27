@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument("--camera", type=str, default="CAM_FRONT")
     parser.add_argument("--max_samples", type=int, default=0, help="0 means no limit.")
     parser.add_argument("--max_scenes", type=int, default=0, help="0 means no scene limit.")
+    parser.add_argument("--num_scenes", type=int, default=None, help="Alias for --max_scenes; 0 means no scene limit.")
     parser.add_argument(
         "--require_camera_file",
         type=lambda x: str(x).lower() == "true",
@@ -302,6 +303,11 @@ def write_record(record: Dict[str, Any], output_jsonl: str):
 
 
 def build_gt_action_chunks(args):
+    if args.num_scenes is not None:
+        if args.max_scenes not in (0, args.num_scenes):
+            raise ValueError("--num_scenes and --max_scenes disagree; pass only one scene limit.")
+        args.max_scenes = int(args.num_scenes)
+
     os.makedirs(os.path.dirname(os.path.abspath(args.output_jsonl)), exist_ok=True)
     if os.path.exists(args.output_jsonl):
         os.remove(args.output_jsonl)
