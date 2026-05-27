@@ -298,6 +298,7 @@ def train(args):
 
     checkpoint = {
         "action_head_state_dict": action_head.state_dict(),
+        "fusion_action_head_state_dict": action_head.state_dict(),
         "config": {
             "hidden_dim": 3584,
             "chunk_size": 10,

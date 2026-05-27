@@ -285,6 +285,7 @@ def collect_samples(records: List[Dict[str, Any]], args):
         if (
             args.model_type
             in (
+                "fusion",
                 "frozen_fusion_curvature_residual",
                 "gated_geometry_residual_fusion",
                 "query_gated_geometry_residual_fusion",
@@ -464,11 +465,11 @@ def load_fusion_head(checkpoint: Dict[str, Any], device: torch.device) -> torch.
             "action_head_state_dict, or state_dict"
         )
     if is_legacy:
-        print(f"[EvalActionHead] warning: using legacy fusion checkpoint format key={state_key}")
+        print(f"[EvalFusion] loading legacy fusion checkpoint format: {state_key}")
 
     if _is_continuous_action_head_state_dict(state_dict) and not _is_fusion_action_head_state_dict(state_dict):
         print(
-            "[EvalActionHead] warning: legacy action_head_state_dict is a qwen-hidden "
+            "[EvalFusion] warning: legacy checkpoint is a qwen-hidden "
             "ContinuousActionHead; evaluating it through fusion adapter and ignoring ego_history."
         )
         action_head = ContinuousActionHead(
@@ -1331,20 +1332,29 @@ def evaluate_qwen_hidden(args, samples: List[Dict[str, Any]], device: torch.devi
 def evaluate_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
     checkpoint = load_checkpoint(args.checkpoint, device)
     fusion_head = load_fusion_head(checkpoint, device)
-    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    hidden_cache = load_hidden_cache(args.hidden_cache)
+    if hidden_cache is None:
+        qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    else:
+        qwen_model, processor = None, None
+        print(f"[EvalFusion] using_hidden_cache={args.hidden_cache} num_cached={hidden_cache.get('num_cached')}")
+        print("[EvalFusion] hidden cache mode: Qwen model will not be loaded")
     sums = Counter()
     with torch.no_grad():
         for sample in samples:
-            inputs = build_qwen_inputs(
-                prompt=sample["planning_prompt"],
-                images=sample["image_path"],
-                processor=processor,
-                model=qwen_model,
-                args=args,
-                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
-            )
-            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
-            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            if hidden_cache is None:
+                inputs = build_qwen_inputs(
+                    prompt=sample["planning_prompt"],
+                    images=sample["image_path"],
+                    processor=processor,
+                    model=qwen_model,
+                    args=args,
+                    get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+                )
+                last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+                planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            else:
+                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
             planning_hidden = planning_hidden.to(device=device, dtype=next(fusion_head.parameters()).dtype)
             ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
             pred_train = fusion_head(planning_hidden, ego_history)
