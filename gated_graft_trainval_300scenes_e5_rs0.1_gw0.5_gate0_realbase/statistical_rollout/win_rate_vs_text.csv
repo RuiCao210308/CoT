@@ -1,0 +1,9 @@
+model,metric,num_common_samples,win_rate_vs_text,mean_improvement_vs_text,median_improvement_vs_text
+fusion,rollout_ade,0,,,
+fusion,rollout_fde,0,,,
+fusion,lateral_mae,0,,,
+fusion,final_lateral_error,0,,,
+gated_graft,rollout_ade,0,,,
+gated_graft,rollout_fde,0,,,
+gated_graft,lateral_mae,0,,,
+gated_graft,final_lateral_error,0,,,

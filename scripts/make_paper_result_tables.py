@@ -11,6 +11,7 @@ MODEL_ORDER = [
     "Ego-only",
     "Qwen-hidden",
     "Fusion",
+    "Gated-GRAFT",
     "Stage7C",
     "Stage7D",
     "Stage7E",
@@ -32,6 +33,11 @@ MODEL_ALIASES = {
     "qwen-hidden-only": "Qwen-hidden",
     "fusion": "Fusion",
     "egovla_chunk": "Fusion",
+    "gated_graft": "Gated-GRAFT",
+    "gated-graft": "Gated-GRAFT",
+    "gated geometry residual fusion": "Gated-GRAFT",
+    "gated_geometry_residual_fusion": "Gated-GRAFT",
+    "gated-geometry-residual-fusion": "Gated-GRAFT",
     "stage7c": "Stage7C",
     "stage 7c": "Stage7C",
     "predicted_geometry_sequence_fusion": "Stage7C",
@@ -69,6 +75,18 @@ TEXT_DEGENERACY_COLUMNS = [
     "reused_history_pairs",
     "reused_history_pairs_rate",
 ]
+BENCHMARK_SUMMARY_COLUMNS = [
+    "model",
+    "total_records",
+    "parse_success",
+    "text_clean_count",
+    "flat_repeat_rate",
+    "history_reuse_rate",
+    "speed_delta_mae",
+    "curvature_delta_mae",
+    "lateral_mae",
+    "final_lateral_error",
+]
 
 
 def parse_args():
@@ -82,6 +100,8 @@ def parse_args():
     parser.add_argument("--scenario_json", required=True)
     parser.add_argument("--rollout_json", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--metric_summary_md", default=None)
+    parser.add_argument("--metric_summary_csv", default=None)
     parser.set_defaults(underline_second=True)
     parser.add_argument("--underline_second", dest="underline_second", action="store_true")
     parser.add_argument("--no_underline_second", dest="underline_second", action="store_false")
@@ -226,6 +246,7 @@ def metric_ranks(
 
 
 def write_csv(path: str, columns: Sequence[str], rows: List[Dict[str, Any]]):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(columns), extrasaction="ignore")
         writer.writeheader()
@@ -344,6 +365,29 @@ def write_table_bundle(
     )
 
 
+def plain_cell(column: str, value: Any) -> str:
+    if value is None:
+        return ""
+    if column.endswith("_rate"):
+        number = finite_number(value)
+        return "" if number is None else f"{number * 100:.2f}%"
+    if isinstance(value, float):
+        return format_number(value)
+    return str(value)
+
+
+def write_plain_markdown(path: str, columns: Sequence[str], rows: List[Dict[str, Any]]):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---" if column == "model" else "---:" for column in columns]) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(plain_cell(column, row.get(column)) for column in columns) + " |")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def load_overall_rows(named_paths: Sequence[str]) -> List[Dict[str, Any]]:
     rows = []
     for value in named_paths:
@@ -407,6 +451,56 @@ def text_degeneracy_rows(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def benchmark_metric_summary_rows(scenario_json: str, rollout_json: str) -> List[Dict[str, Any]]:
+    rows_by_model: Dict[str, Dict[str, Any]] = {}
+
+    for item in load_grouped_report(scenario_json):
+        model = canonical_model(item.get("name") or item.get("model"))
+        groups = item.get("groups", {})
+        all_group = groups.get("all", {}) if isinstance(groups, dict) else {}
+        text_clean = groups.get("text_clean", {}) if isinstance(groups, dict) else {}
+        parse_success = item.get("parse_success")
+        row = rows_by_model.setdefault("model:" + model, {"model": model})
+        row.update(
+            {
+                "total_records": item.get("total_records"),
+                "parse_success": parse_success,
+                "text_clean_count": text_clean.get("count") if isinstance(text_clean, dict) else None,
+                "flat_repeat_rate": rate(item.get("flat_repeated_pair"), parse_success),
+                "history_reuse_rate": rate(item.get("reused_history_pairs"), parse_success),
+                "speed_delta_mae": all_group.get("speed_delta_mae") if isinstance(all_group, dict) else None,
+                "curvature_delta_mae": all_group.get("curvature_delta_mae") if isinstance(all_group, dict) else None,
+            }
+        )
+
+    for item in load_grouped_report(rollout_json):
+        model = canonical_model(item.get("name") or item.get("model"))
+        groups = item.get("groups", {})
+        all_group = groups.get("all", {}) if isinstance(groups, dict) else {}
+        row = rows_by_model.setdefault("model:" + model, {"model": model})
+        row.setdefault("total_records", item.get("total_records"))
+        row.setdefault("parse_success", item.get("evaluated_records"))
+        if isinstance(all_group, dict):
+            row["lateral_mae"] = all_group.get("lateral_mae")
+            row["final_lateral_error"] = all_group.get("final_lateral_error")
+
+    rows = list(rows_by_model.values())
+    for row in rows:
+        for column in BENCHMARK_SUMMARY_COLUMNS:
+            row.setdefault(column, None)
+    rows.sort(key=lambda row: model_sort_key(row["model"]))
+    return rows
+
+
+def write_benchmark_metric_summary(output_dir: str, md_path: Optional[str], csv_path: Optional[str], rows: List[Dict[str, Any]]):
+    md_path = md_path or os.path.join(output_dir, "paper_metric_summary.md")
+    csv_path = csv_path or os.path.join(output_dir, "paper_metric_summary.csv")
+    write_csv(csv_path, BENCHMARK_SUMMARY_COLUMNS, rows)
+    write_plain_markdown(md_path, BENCHMARK_SUMMARY_COLUMNS, rows)
+    print(f"[PaperResultTables] wrote benchmark metric summary md: {md_path}")
+    print(f"[PaperResultTables] wrote benchmark metric summary csv: {csv_path}")
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -415,6 +509,7 @@ def main():
     scenario_rows = grouped_metric_rows(args.scenario_json, SCENARIO_METRICS)
     rollout_rows = grouped_metric_rows(args.rollout_json, ROLLOUT_METRICS)
     degeneracy_rows = text_degeneracy_rows(args.scenario_json)
+    benchmark_rows = benchmark_metric_summary_rows(args.scenario_json, args.rollout_json)
 
     write_table_bundle(
         args.output_dir,
@@ -460,6 +555,7 @@ def main():
         "tab:text_degeneracy",
         args.underline_second,
     )
+    write_benchmark_metric_summary(args.output_dir, args.metric_summary_md, args.metric_summary_csv, benchmark_rows)
 
     print(f"[PaperResultTables] wrote tables to: {args.output_dir}")
     return 0
