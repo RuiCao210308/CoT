@@ -81,6 +81,9 @@ def parse_args():
     parser.add_argument("--dt", type=float, default=0.5)
     parser.add_argument("--hidden_cache", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--log_interval_steps", type=int, default=0)
+    parser.add_argument("--step_history_jsonl", type=str, default=None)
+    parser.add_argument("--tensorboard_logdir", type=str, default=None)
     return parser.parse_args()
 
 
@@ -146,6 +149,78 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+class StepMetricLogger:
+    def __init__(
+        self,
+        log_interval_steps: int,
+        jsonl_path: Optional[str],
+        tensorboard_logdir: Optional[str],
+        prefix: str,
+    ):
+        self.log_interval_steps = int(log_interval_steps or 0)
+        self.jsonl_path = jsonl_path
+        self.pending: List[Dict[str, float]] = []
+        self.step_history: List[Dict[str, Any]] = []
+        self.writer = None
+        self.prefix = prefix
+        if self.jsonl_path:
+            os.makedirs(os.path.dirname(self.jsonl_path) or ".", exist_ok=True)
+            if os.path.exists(self.jsonl_path):
+                print(f"{self.prefix} appending step history: {self.jsonl_path}")
+            else:
+                print(f"{self.prefix} writing step history: {self.jsonl_path}")
+        if tensorboard_logdir:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError as exc:
+                raise ImportError(
+                    "TensorBoard logging requires tensorboard. Please run: pip install tensorboard"
+                ) from exc
+            try:
+
+                self.writer = SummaryWriter(log_dir=tensorboard_logdir)
+                print(f"{self.prefix} writing tensorboard logs: {tensorboard_logdir}")
+            except Exception as exc:
+                raise RuntimeError(f"failed to initialize TensorBoard writer: {tensorboard_logdir}") from exc
+
+    def add(self, metrics: Dict[str, float], step: int, epoch: int, lr: float) -> None:
+        if self.log_interval_steps <= 0:
+            return
+        self.pending.append(metrics)
+        if len(self.pending) >= self.log_interval_steps:
+            self.flush(step=step, epoch=epoch, lr=lr)
+
+    def flush(self, step: int, epoch: int, lr: float) -> None:
+        if self.log_interval_steps <= 0 or not self.pending:
+            return
+        keys = sorted({key for row in self.pending for key in row})
+        record: Dict[str, Any] = {
+            "step": int(step),
+            "epoch": int(epoch),
+            "window_steps": int(len(self.pending)),
+            "lr": float(lr),
+        }
+        for key in keys:
+            values = [float(row[key]) for row in self.pending if key in row]
+            if values:
+                record[key] = sum(values) / len(values)
+        if self.jsonl_path:
+            with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+                f.flush()
+        if self.writer is not None:
+            for key, value in record.items():
+                if isinstance(value, (int, float)) and key not in {"step", "epoch", "window_steps"}:
+                    self.writer.add_scalar(f"train/{key}", float(value), int(step))
+            self.writer.flush()
+        self.step_history.append(record)
+        self.pending = []
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
 
 
 def load_hidden_cache(path: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -426,6 +501,12 @@ def train_gated_geometry_residual_fusion(args):
 
     global_step = 0
     train_history = []
+    step_logger = StepMetricLogger(
+        args.log_interval_steps,
+        args.step_history_jsonl,
+        args.tensorboard_logdir,
+        prefix="[GatedGeometryResidualFusionTrain]",
+    )
     for epoch in range(args.epochs):
         epoch_total_loss = 0.0
         epoch_action_loss = 0.0
@@ -487,6 +568,23 @@ def train_gated_geometry_residual_fusion(args):
             epoch_base_curvature_l1 += float(base_curvature_l1)
             epoch_gate_mean += float(gate_mean)
             epoch_residual_abs += float(residual_abs)
+            step_logger.add(
+                {
+                    "total_loss": float(total_loss.detach()),
+                    "action_loss": float(action_loss.detach()),
+                    "speed_l1": float(speed_l1),
+                    "curvature_l1": float(curvature_l1),
+                    "base_speed_l1": float(base_speed_l1),
+                    "base_curvature_l1": float(base_curvature_l1),
+                    "geometry_descriptor_loss": float(geo_desc_loss.detach()),
+                    "gate_loss": float(gate_loss.detach()),
+                    "gate_mean": float(gate_mean),
+                    "residual_abs_mean": float(residual_abs),
+                },
+                step=global_step,
+                epoch=epoch + 1,
+                lr=optimizer.param_groups[0]["lr"],
+            )
 
             if global_step % 10 == 0:
                 print(
@@ -527,6 +625,8 @@ def train_gated_geometry_residual_fusion(args):
             f"steps={epoch_summary['steps']}"
         )
 
+    step_logger.flush(step=global_step, epoch=args.epochs, lr=optimizer.param_groups[0]["lr"])
+    step_logger.close()
     checkpoint = {
         "geometry_descriptor_head_state_dict": geometry_descriptor_head.state_dict(),
         "gated_residual_head_state_dict": gated_residual_head.state_dict(),
@@ -572,6 +672,9 @@ def train_gated_geometry_residual_fusion(args):
             "target_curvature_scale": 100.0,
             "seed": args.seed,
             "hidden_cache": args.hidden_cache,
+            "log_interval_steps": args.log_interval_steps,
+            "step_history_jsonl": args.step_history_jsonl,
+            "tensorboard_logdir": args.tensorboard_logdir,
         },
         "source_action_schema": SOURCE_ACTION_SCHEMA,
         "train_action_schema": TRAIN_ACTION_SCHEMA,
@@ -579,6 +682,7 @@ def train_gated_geometry_residual_fusion(args):
         "jsonl_path": args.jsonl,
         "global_step": global_step,
         "train_history": train_history,
+        "step_history": step_logger.step_history,
     }
     if is_query_decoder:
         checkpoint["query_gated_residual_head_state_dict"] = checkpoint.pop("gated_residual_head_state_dict")

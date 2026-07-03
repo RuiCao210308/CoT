@@ -43,6 +43,16 @@ def parse_args():
     parser.add_argument("--speed_weight", type=float, default=1.0)
     parser.add_argument("--curvature_weight", type=float, default=1.0)
     parser.add_argument("--hidden_cache", type=str, default=None)
+    parser.add_argument("--log_interval_steps", type=int, default=0)
+    parser.add_argument("--step_history_jsonl", type=str, default=None)
+    parser.add_argument("--tensorboard_logdir", type=str, default=None)
+    parser.add_argument(
+        "--ablation_mode",
+        choices=("full", "ego_only", "vlm_only", "shuffled_vlm", "zero_history"),
+        default="full",
+        help="Input ablation for attribution experiments; does not change the FusionActionHead architecture.",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Seed used for deterministic ablation shuffling.")
     return parser.parse_args()
 
 
@@ -171,14 +181,105 @@ def qwen_train_message_builder(system_message: str):
     return _get_message
 
 
+def attach_shuffled_hidden_indices(samples: List[Dict[str, Any]], seed: int) -> None:
+    record_indices = [int(sample["record_index"]) for sample in samples]
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    permutation = torch.randperm(len(record_indices), generator=generator).tolist()
+    for sample, shuffled_pos in zip(samples, permutation):
+        sample["hidden_record_index"] = record_indices[int(shuffled_pos)]
+
+
+def apply_ablation_inputs(
+    planning_hidden: torch.Tensor,
+    ego_history: torch.Tensor,
+    ablation_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if ablation_mode == "ego_only":
+        planning_hidden = torch.zeros_like(planning_hidden)
+    elif ablation_mode in ("vlm_only", "zero_history"):
+        ego_history = torch.zeros_like(ego_history)
+    return planning_hidden, ego_history
+
+
+class StepMetricLogger:
+    def __init__(self, log_interval_steps: int, jsonl_path: Optional[str], tensorboard_logdir: Optional[str]):
+        self.log_interval_steps = int(log_interval_steps or 0)
+        self.jsonl_path = jsonl_path
+        self.pending: List[Dict[str, float]] = []
+        self.step_history: List[Dict[str, Any]] = []
+        self.writer = None
+        if self.jsonl_path:
+            os.makedirs(os.path.dirname(self.jsonl_path) or ".", exist_ok=True)
+            if os.path.exists(self.jsonl_path):
+                print(f"[FusionHeadTrain] appending step history: {self.jsonl_path}")
+            else:
+                print(f"[FusionHeadTrain] writing step history: {self.jsonl_path}")
+        if tensorboard_logdir:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError as exc:
+                raise ImportError(
+                    "TensorBoard logging requires tensorboard. Please run: pip install tensorboard"
+                ) from exc
+            try:
+
+                self.writer = SummaryWriter(log_dir=tensorboard_logdir)
+                print(f"[FusionHeadTrain] writing tensorboard logs: {tensorboard_logdir}")
+            except Exception as exc:
+                raise RuntimeError(f"failed to initialize TensorBoard writer: {tensorboard_logdir}") from exc
+
+    def add(self, metrics: Dict[str, float], step: int, epoch: int, lr: float) -> None:
+        if self.log_interval_steps <= 0:
+            return
+        self.pending.append(metrics)
+        if len(self.pending) >= self.log_interval_steps:
+            self.flush(step=step, epoch=epoch, lr=lr)
+
+    def flush(self, step: int, epoch: int, lr: float) -> None:
+        if self.log_interval_steps <= 0 or not self.pending:
+            return
+        keys = sorted({key for row in self.pending for key in row})
+        record: Dict[str, Any] = {
+            "step": int(step),
+            "epoch": int(epoch),
+            "window_steps": int(len(self.pending)),
+            "lr": float(lr),
+        }
+        for key in keys:
+            values = [float(row[key]) for row in self.pending if key in row]
+            if values:
+                record[key] = sum(values) / len(values)
+        if self.jsonl_path:
+            with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+                f.flush()
+        if self.writer is not None:
+            for key, value in record.items():
+                if isinstance(value, (int, float)) and key not in {"step", "epoch", "window_steps"}:
+                    self.writer.add_scalar(f"train/{key}", float(value), int(step))
+            self.writer.flush()
+        self.step_history.append(record)
+        self.pending = []
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+
+
 def train(args):
     if args.batch_size != 1:
         raise ValueError("train_fusion_action_head.py currently supports batch_size=1 only.")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    torch.manual_seed(int(args.seed))
     records, skipped = load_jsonl_records(args.jsonl)
     hidden_cache = load_hidden_cache(args.hidden_cache)
+    if args.ablation_mode == "shuffled_vlm" and hidden_cache is None:
+        raise ValueError("--ablation_mode shuffled_vlm requires --hidden_cache for fixed sample-level shuffling.")
     samples, sample_skipped = collect_samples(records, args, use_hidden_cache=hidden_cache is not None)
+    if args.ablation_mode == "shuffled_vlm":
+        attach_shuffled_hidden_indices(samples, args.seed)
     skipped.update(sample_skipped)
     print(
         f"[FusionHeadTrain] loaded_records={len(records)} usable_samples={len(samples)} "
@@ -193,6 +294,7 @@ def train(args):
         f"[FusionHeadTrain] loss_weights speed_weight={args.speed_weight} "
         f"curvature_weight={args.curvature_weight}"
     )
+    print(f"[FusionHeadTrain] ablation_mode={args.ablation_mode} seed={args.seed}")
     if not samples:
         print("[FusionHeadTrain] no usable samples")
         return 1
@@ -222,6 +324,7 @@ def train(args):
 
     global_step = 0
     train_history = []
+    step_logger = StepMetricLogger(args.log_interval_steps, args.step_history_jsonl, args.tensorboard_logdir)
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         epoch_speed_l1 = 0.0
@@ -242,9 +345,11 @@ def train(args):
                     last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
                     planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
             else:
-                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
+                hidden_record_index = int(sample.get("hidden_record_index", sample["record_index"]))
+                planning_hidden = cached_planning_hidden(hidden_cache, hidden_record_index)
             planning_hidden = planning_hidden.to(device=device, dtype=next(fusion_head.parameters()).dtype)
             ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            planning_hidden, ego_history = apply_ablation_inputs(planning_hidden, ego_history, args.ablation_mode)
             target = sample["target"].to(device=device, dtype=planning_hidden.dtype)
 
             pred = fusion_head(planning_hidden, ego_history)
@@ -266,6 +371,16 @@ def train(args):
             epoch_loss += float(loss.detach())
             epoch_speed_l1 += float(speed_l1)
             epoch_curvature_l1 += float(curvature_l1)
+            step_logger.add(
+                {
+                    "loss": float(loss.detach()),
+                    "speed_l1": float(speed_l1),
+                    "curvature_l1": float(curvature_l1),
+                },
+                step=global_step,
+                epoch=epoch + 1,
+                lr=optimizer.param_groups[0]["lr"],
+            )
 
             if global_step % 10 == 0 or global_step == 1:
                 print(
@@ -288,6 +403,8 @@ def train(args):
             f"steps={epoch_summary['steps']}"
         )
 
+    step_logger.flush(step=global_step, epoch=args.epochs, lr=optimizer.param_groups[0]["lr"])
+    step_logger.close()
     checkpoint = {
         "fusion_action_head_state_dict": fusion_head.state_dict(),
         "config": {
@@ -307,12 +424,18 @@ def train(args):
             "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
             "hidden_cache": args.hidden_cache,
+            "log_interval_steps": args.log_interval_steps,
+            "step_history_jsonl": args.step_history_jsonl,
+            "tensorboard_logdir": args.tensorboard_logdir,
+            "ablation_mode": args.ablation_mode,
+            "seed": args.seed,
         },
         "source_action_schema": SOURCE_ACTION_SCHEMA,
         "train_action_schema": TRAIN_ACTION_SCHEMA,
         "jsonl_path": args.jsonl,
         "global_step": global_step,
         "train_history": train_history,
+        "step_history": step_logger.step_history,
     }
     ckpt_path = os.path.join(args.output_dir, "fusion_action_head.pt")
     torch.save(checkpoint, ckpt_path)

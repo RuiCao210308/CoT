@@ -1,0 +1,33 @@
+Selected qualitative cases
+================================================================================
+
+Case 1
+  scene_name: scene-0012
+  frame_idx: 27
+  sample_token: 7c3328b43154403cac0991fd6e967de9
+  target_abs_curvature_x100: 0.8865026046987623
+  target_speed_change: 2.634504795074463
+  OpenEMMA Text ADE/FDE/Lat/FinalLat: 4.273, 12.648, 3.547, 11.003
+  Stage7F ADE/FDE/Lat/FinalLat: 0.912, 1.072, 0.562, 1.069
+  final lateral improvement: 9.933
+
+Case 2
+  scene_name: scene-0099
+  frame_idx: 18
+  sample_token: 726c4eb7ce3e490e908dfc5a5ad9dd19
+  target_abs_curvature_x100: 0.221810860093683
+  target_speed_change: 1.630803108215332
+  OpenEMMA Text ADE/FDE/Lat/FinalLat: 5.952, 14.419, 3.499, 9.420
+  Stage7F ADE/FDE/Lat/FinalLat: 3.225, 5.656, 0.864, 1.316
+  final lateral improvement: 8.105
+
+Case 3
+  scene_name: scene-0093
+  frame_idx: 10
+  sample_token: 561cf9acfda645b79bc52ec82537970c
+  target_abs_curvature_x100: 0.46214673177018994
+  target_speed_change: 2.8807473182678223
+  OpenEMMA Text ADE/FDE/Lat/FinalLat: 7.002, 19.332, 4.331, 11.625
+  Stage7F ADE/FDE/Lat/FinalLat: 2.551, 3.957, 1.479, 3.659
+  final lateral improvement: 7.966
+

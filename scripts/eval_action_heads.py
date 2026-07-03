@@ -103,6 +103,13 @@ def parse_args():
     parser.add_argument("--dt", type=float, default=None, help="Waypoint-to-action dt; defaults to checkpoint config then 0.5.")
     parser.add_argument("--max_abs_curvature_1pm", type=float, default=0.2)
     parser.add_argument("--hidden_cache", type=str, default=None)
+    parser.add_argument(
+        "--ablation_mode",
+        choices=("full", "ego_only", "vlm_only", "shuffled_vlm", "zero_history"),
+        default="full",
+        help="Input ablation for fusion/qwen-hidden evaluation. Does not change checkpoint weights.",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Seed used for deterministic shuffled_vlm evaluation.")
     return parser.parse_args()
 
 
@@ -282,15 +289,12 @@ def collect_samples(records: List[Dict[str, Any]], args):
             "gated_geometry_residual_fusion",
             "query_gated_geometry_residual_fusion",
         )
-        if (
-            args.model_type
-            in (
-                "fusion",
-                "frozen_fusion_curvature_residual",
-                "gated_geometry_residual_fusion",
-                "query_gated_geometry_residual_fusion",
-            )
-            and args.hidden_cache
+        if args.hidden_cache and args.model_type in (
+            "qwen_hidden",
+            "fusion",
+            "frozen_fusion_curvature_residual",
+            "gated_geometry_residual_fusion",
+            "query_gated_geometry_residual_fusion",
         ):
             needs_qwen_inputs = False
         if needs_qwen_inputs:
@@ -394,6 +398,27 @@ def cached_planning_hidden(cache: Dict[str, Any], record_index: int) -> torch.Te
             f"({EXPECTED_QWEN_HIDDEN_DIM},), got {tuple(hidden.shape)}"
         )
     return hidden.unsqueeze(0)
+
+
+def attach_shuffled_hidden_indices(samples: List[Dict[str, Any]], seed: int) -> None:
+    record_indices = [int(sample["record_index"]) for sample in samples]
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    permutation = torch.randperm(len(record_indices), generator=generator).tolist()
+    for sample, shuffled_pos in zip(samples, permutation):
+        sample["hidden_record_index"] = record_indices[int(shuffled_pos)]
+
+
+def apply_ablation_inputs(
+    planning_hidden: torch.Tensor,
+    ego_history: Optional[torch.Tensor],
+    ablation_mode: str,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if ablation_mode == "ego_only":
+        planning_hidden = torch.zeros_like(planning_hidden)
+    elif ablation_mode in ("vlm_only", "zero_history") and ego_history is not None:
+        ego_history = torch.zeros_like(ego_history)
+    return planning_hidden, ego_history
 
 
 def load_ego_head(checkpoint: Dict[str, Any], device: torch.device) -> EgoOnlyActionHead:
@@ -1052,6 +1077,8 @@ def finalize_metrics(args, loaded_records: int, skipped: Counter, sums: Dict[str
         "jsonl": args.jsonl,
         "checkpoint": args.checkpoint,
         "hidden_cache": args.hidden_cache,
+        "ablation_mode": args.ablation_mode,
+        "seed": args.seed,
         "model_path": args.model_path,
         "dataroot": args.dataroot,
         "start_index": args.start_index,
@@ -1307,21 +1334,31 @@ def evaluate_ego_only(args, samples: List[Dict[str, Any]], device: torch.device)
 def evaluate_qwen_hidden(args, samples: List[Dict[str, Any]], device: torch.device):
     checkpoint = load_checkpoint(args.checkpoint, device)
     action_head = load_qwen_hidden_head(checkpoint, device)
-    qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    hidden_cache = load_hidden_cache(args.hidden_cache)
+    if hidden_cache is None:
+        qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
+    else:
+        qwen_model, processor = None, None
+        print(f"[EvalQwenHidden] using_hidden_cache={args.hidden_cache} num_cached={hidden_cache.get('num_cached')}")
+        print("[EvalQwenHidden] hidden cache mode: Qwen model will not be loaded")
     sums = Counter()
     with torch.no_grad():
         for sample in samples:
-            inputs = build_qwen_inputs(
-                prompt=sample["planning_prompt"],
-                images=sample["image_path"],
-                processor=processor,
-                model=qwen_model,
-                args=args,
-                get_message_fn=qwen_eval_message_builder(sample["system_message"]),
-            )
-            last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
-            planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            if hidden_cache is None:
+                inputs = build_qwen_inputs(
+                    prompt=sample["planning_prompt"],
+                    images=sample["image_path"],
+                    processor=processor,
+                    model=qwen_model,
+                    args=args,
+                    get_message_fn=qwen_eval_message_builder(sample["system_message"]),
+                )
+                last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
+                planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
+            else:
+                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
             planning_hidden = planning_hidden.to(device=device, dtype=next(action_head.parameters()).dtype)
+            planning_hidden, _ = apply_ablation_inputs(planning_hidden, None, args.ablation_mode)
             pred_train = action_head(planning_hidden)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)
@@ -1333,6 +1370,10 @@ def evaluate_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
     checkpoint = load_checkpoint(args.checkpoint, device)
     fusion_head = load_fusion_head(checkpoint, device)
     hidden_cache = load_hidden_cache(args.hidden_cache)
+    if args.ablation_mode == "shuffled_vlm":
+        if hidden_cache is None:
+            raise ValueError("--ablation_mode shuffled_vlm requires --hidden_cache for fixed sample-level shuffling.")
+        attach_shuffled_hidden_indices(samples, args.seed)
     if hidden_cache is None:
         qwen_model, processor = load_qwen_model_and_processor(args.model_path, str(device))
     else:
@@ -1354,9 +1395,11 @@ def evaluate_fusion(args, samples: List[Dict[str, Any]], device: torch.device):
                 last_hidden_state = extract_qwen_hidden_states(inputs, qwen_model)
                 planning_hidden = select_planning_hidden(last_hidden_state, inputs["attention_mask"])
             else:
-                planning_hidden = cached_planning_hidden(hidden_cache, int(sample["record_index"]))
+                hidden_record_index = int(sample.get("hidden_record_index", sample["record_index"]))
+                planning_hidden = cached_planning_hidden(hidden_cache, hidden_record_index)
             planning_hidden = planning_hidden.to(device=device, dtype=next(fusion_head.parameters()).dtype)
             ego_history = sample["ego_history"].to(device=device, dtype=planning_hidden.dtype)
+            planning_hidden, ego_history = apply_ablation_inputs(planning_hidden, ego_history, args.ablation_mode)
             pred_train = fusion_head(planning_hidden, ego_history)
             target_train = sample["target_train"].to(device=device, dtype=pred_train.dtype)
             update_metric_sums(sums, pred_train, target_train)

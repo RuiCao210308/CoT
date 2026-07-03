@@ -1,0 +1,138 @@
+{
+  "records": [
+    {
+      "flat_repeated_pair": 0,
+      "groups": {
+        "all": {
+          "count": 3584,
+          "curvature_delta_mae": 0.42932968507602076,
+          "curvature_mae_x100": 0.8425989661570513,
+          "overall_l1_train_scale": 0.9560023314510805,
+          "speed_delta_mae": 0.25411962035883195,
+          "speed_mae_mps": 1.0694056968672416
+        },
+        "high_curvature_top20": {
+          "count": 717,
+          "curvature_delta_mae": 1.292732291065718,
+          "curvature_mae_x100": 2.995845840628177,
+          "overall_l1_train_scale": 2.1068901844021335,
+          "speed_delta_mae": 0.2964284331061968,
+          "speed_mae_mps": 1.2179345319065755
+        },
+        "speed_changing_top20": {
+          "count": 717,
+          "curvature_delta_mae": 0.6790994718372696,
+          "curvature_mae_x100": 1.354984357916702,
+          "overall_l1_train_scale": 1.6156936240079844,
+          "speed_delta_mae": 0.4244338520216787,
+          "speed_mae_mps": 1.876402886280455
+        },
+        "steady_low_curvature": {
+          "count": 537,
+          "curvature_delta_mae": 0.035546616888332376,
+          "curvature_mae_x100": 0.04856410149824797,
+          "overall_l1_train_scale": 0.2336327944859668,
+          "speed_delta_mae": 0.10295960607339887,
+          "speed_mae_mps": 0.41870148546535874
+        },
+        "text_clean": {
+          "count": 3584,
+          "curvature_delta_mae": 0.42932968507602076,
+          "curvature_mae_x100": 0.8425989661570513,
+          "overall_l1_train_scale": 0.9560023314510805,
+          "speed_delta_mae": 0.25411962035883195,
+          "speed_mae_mps": 1.0694056968672416
+        },
+        "text_non_flat": {
+          "count": 3584,
+          "curvature_delta_mae": 0.42932968507602076,
+          "curvature_mae_x100": 0.8425989661570513,
+          "overall_l1_train_scale": 0.9560023314510805,
+          "speed_delta_mae": 0.25411962035883195,
+          "speed_mae_mps": 1.0694056968672416
+        },
+        "text_non_reused": {
+          "count": 3584,
+          "curvature_delta_mae": 0.42932968507602076,
+          "curvature_mae_x100": 0.8425989661570513,
+          "overall_l1_train_scale": 0.9560023314510805,
+          "speed_delta_mae": 0.25411962035883195,
+          "speed_mae_mps": 1.0694056968672416
+        }
+      },
+      "name": "fusion",
+      "parse_failed": 0,
+      "parse_success": 3584,
+      "path": "/root/autodl-tmp/fusion_trainval_850scenes_e5_real/eval_records.jsonl",
+      "reused_history_pairs": 0,
+      "total_records": 3584
+    },
+    {
+      "flat_repeated_pair": 0,
+      "groups": {
+        "all": {
+          "count": 3584,
+          "curvature_delta_mae": 0.4272002902557692,
+          "curvature_mae_x100": 0.8369807929891196,
+          "overall_l1_train_scale": 1.024120295619858,
+          "speed_delta_mae": 0.29008172944221783,
+          "speed_mae_mps": 1.2112597963236371
+        },
+        "high_curvature_top20": {
+          "count": 717,
+          "curvature_delta_mae": 1.2916302210799366,
+          "curvature_mae_x100": 2.994957817419636,
+          "overall_l1_train_scale": 2.2023169407452166,
+          "speed_delta_mae": 0.3376582689868132,
+          "speed_mae_mps": 1.409676051362206
+        },
+        "speed_changing_top20": {
+          "count": 717,
+          "curvature_delta_mae": 0.6783405586012401,
+          "curvature_mae_x100": 1.3499263917437574,
+          "overall_l1_train_scale": 1.6093004111049898,
+          "speed_delta_mae": 0.43033791701595253,
+          "speed_mae_mps": 1.8686744256082772
+        },
+        "steady_low_curvature": {
+          "count": 537,
+          "curvature_delta_mae": 0.025692636147870103,
+          "curvature_mae_x100": 0.0377660285606911,
+          "overall_l1_train_scale": 0.19805450862346416,
+          "speed_delta_mae": 0.14407600162837725,
+          "speed_mae_mps": 0.35834298747655846
+        },
+        "text_clean": {
+          "count": 3584,
+          "curvature_delta_mae": 0.4272002902557692,
+          "curvature_mae_x100": 0.8369807929891196,
+          "overall_l1_train_scale": 1.024120295619858,
+          "speed_delta_mae": 0.29008172944221783,
+          "speed_mae_mps": 1.2112597963236371
+        },
+        "text_non_flat": {
+          "count": 3584,
+          "curvature_delta_mae": 0.4272002902557692,
+          "curvature_mae_x100": 0.8369807929891196,
+          "overall_l1_train_scale": 1.024120295619858,
+          "speed_delta_mae": 0.29008172944221783,
+          "speed_mae_mps": 1.2112597963236371
+        },
+        "text_non_reused": {
+          "count": 3584,
+          "curvature_delta_mae": 0.4272002902557692,
+          "curvature_mae_x100": 0.8369807929891196,
+          "overall_l1_train_scale": 1.024120295619858,
+          "speed_delta_mae": 0.29008172944221783,
+          "speed_mae_mps": 1.2112597963236371
+        }
+      },
+      "name": "gated_graft",
+      "parse_failed": 0,
+      "parse_success": 3584,
+      "path": "/root/autodl-tmp/gated_graft_trainval_850scenes_e5_rs0.1_gw0.5_gate0_realbase/eval_records.jsonl",
+      "reused_history_pairs": 0,
+      "total_records": 3584
+    }
+  ]
+}

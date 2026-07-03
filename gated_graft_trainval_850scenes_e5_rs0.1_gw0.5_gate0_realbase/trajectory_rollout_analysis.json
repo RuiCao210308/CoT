@@ -1,0 +1,87 @@
+{
+  "dt": 0.5,
+  "records": [
+    {
+      "evaluated_records": 3584,
+      "groups": {
+        "all": {
+          "count": 3584,
+          "final_lateral_error": 1.7789130941724756,
+          "lateral_mae": 0.6796731607565831,
+          "longitudinal_mae": 2.149897603784719,
+          "rollout_ade": 2.4260628142223895,
+          "rollout_fde": 5.806491259848371
+        },
+        "high_curvature_top20": {
+          "count": 717,
+          "final_lateral_error": 4.194508797248354,
+          "lateral_mae": 1.4890519946339087,
+          "longitudinal_mae": 2.5209166756504504,
+          "rollout_ade": 3.244215389351573,
+          "rollout_fde": 8.253534788564162
+        },
+        "speed_changing_top20": {
+          "count": 717,
+          "final_lateral_error": 2.3163153402342345,
+          "lateral_mae": 0.8539384228625354,
+          "longitudinal_mae": 3.478659436620678,
+          "rollout_ade": 3.7943312924808494,
+          "rollout_fde": 9.575018762835446
+        },
+        "steady_low_curvature": {
+          "count": 537,
+          "final_lateral_error": 0.1600676458047729,
+          "lateral_mae": 0.07492521311272769,
+          "longitudinal_mae": 0.8039289566057931,
+          "rollout_ade": 0.8141488536404036,
+          "rollout_fde": 1.8913261074912853
+        }
+      },
+      "name": "fusion",
+      "path": "/root/autodl-tmp/fusion_trainval_850scenes_e5_real/eval_records.jsonl",
+      "skipped_records": 0,
+      "total_records": 3584
+    },
+    {
+      "evaluated_records": 3584,
+      "groups": {
+        "all": {
+          "count": 3584,
+          "final_lateral_error": 1.655503853044215,
+          "lateral_mae": 0.6101392465955439,
+          "longitudinal_mae": 2.5269923416831337,
+          "rollout_ade": 2.73651651770211,
+          "rollout_fde": 6.425889193797308
+        },
+        "high_curvature_top20": {
+          "count": 717,
+          "final_lateral_error": 3.9565373229031633,
+          "lateral_mae": 1.3695773509189157,
+          "longitudinal_mae": 3.0004996762685026,
+          "rollout_ade": 3.581486111628108,
+          "rollout_fde": 9.152657477254806
+        },
+        "speed_changing_top20": {
+          "count": 717,
+          "final_lateral_error": 2.1783367541313354,
+          "lateral_mae": 0.7823943106267791,
+          "longitudinal_mae": 3.646154533532339,
+          "rollout_ade": 3.9222942127513414,
+          "rollout_fde": 9.728468936774734
+        },
+        "steady_low_curvature": {
+          "count": 537,
+          "final_lateral_error": 0.164845965768071,
+          "lateral_mae": 0.07357254330237038,
+          "longitudinal_mae": 0.6662165582414452,
+          "rollout_ade": 0.678499292965932,
+          "rollout_fde": 1.3484939996117258
+        }
+      },
+      "name": "gated_graft",
+      "path": "/root/autodl-tmp/gated_graft_trainval_850scenes_e5_rs0.1_gw0.5_gate0_realbase/eval_records.jsonl",
+      "skipped_records": 0,
+      "total_records": 3584
+    }
+  ]
+}

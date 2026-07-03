@@ -1,0 +1,27 @@
+Trajectory Rollout Analysis
+
+dt=0.5
+
+## fusion
+
+path: /root/autodl-tmp/fusion_trainval_850scenes_e5_real/eval_records.jsonl
+evaluated_records=3584 skipped_records=0
+
+| group | count | rollout_ade | rollout_fde | longitudinal_mae | lateral_mae | final_lateral_error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| all | 3584 | 2.4261 | 5.8065 | 2.1499 | 0.6797 | 1.7789 |
+| high_curvature_top20 | 717 | 3.2442 | 8.2535 | 2.5209 | 1.4891 | 4.1945 |
+| speed_changing_top20 | 717 | 3.7943 | 9.5750 | 3.4787 | 0.8539 | 2.3163 |
+| steady_low_curvature | 537 | 0.8141 | 1.8913 | 0.8039 | 0.0749 | 0.1601 |
+
+## gated_graft
+
+path: /root/autodl-tmp/gated_graft_trainval_850scenes_e5_rs0.1_gw0.5_gate0_realbase/eval_records.jsonl
+evaluated_records=3584 skipped_records=0
+
+| group | count | rollout_ade | rollout_fde | longitudinal_mae | lateral_mae | final_lateral_error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| all | 3584 | 2.7365 | 6.4259 | 2.5270 | 0.6101 | 1.6555 |
+| high_curvature_top20 | 717 | 3.5815 | 9.1527 | 3.0005 | 1.3696 | 3.9565 |
+| speed_changing_top20 | 717 | 3.9223 | 9.7285 | 3.6462 | 0.7824 | 2.1783 |
+| steady_low_curvature | 537 | 0.6785 | 1.3485 | 0.6662 | 0.0736 | 0.1648 |

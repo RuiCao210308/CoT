@@ -1,0 +1,33 @@
+Action Eval Scenario Analysis
+
+## fusion
+
+path: /root/autodl-tmp/fusion_trainval_850scenes_e5_real/eval_records.jsonl
+parse_success=3584 parse_failed=0
+flat_repeated_pair=0 reused_history_pairs=0
+
+| group | count | speed_mae_mps | curvature_mae_x100 | overall_l1_train_scale | speed_delta_mae | curvature_delta_mae |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| all | 3584 | 1.0694 | 0.8426 | 0.9560 | 0.2541 | 0.4293 |
+| high_curvature_top20 | 717 | 1.2179 | 2.9958 | 2.1069 | 0.2964 | 1.2927 |
+| speed_changing_top20 | 717 | 1.8764 | 1.3550 | 1.6157 | 0.4244 | 0.6791 |
+| steady_low_curvature | 537 | 0.4187 | 0.0486 | 0.2336 | 0.1030 | 0.0355 |
+| text_non_flat | 3584 | 1.0694 | 0.8426 | 0.9560 | 0.2541 | 0.4293 |
+| text_non_reused | 3584 | 1.0694 | 0.8426 | 0.9560 | 0.2541 | 0.4293 |
+| text_clean | 3584 | 1.0694 | 0.8426 | 0.9560 | 0.2541 | 0.4293 |
+
+## gated_graft
+
+path: /root/autodl-tmp/gated_graft_trainval_850scenes_e5_rs0.1_gw0.5_gate0_realbase/eval_records.jsonl
+parse_success=3584 parse_failed=0
+flat_repeated_pair=0 reused_history_pairs=0
+
+| group | count | speed_mae_mps | curvature_mae_x100 | overall_l1_train_scale | speed_delta_mae | curvature_delta_mae |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| all | 3584 | 1.2113 | 0.8370 | 1.0241 | 0.2901 | 0.4272 |
+| high_curvature_top20 | 717 | 1.4097 | 2.9950 | 2.2023 | 0.3377 | 1.2916 |
+| speed_changing_top20 | 717 | 1.8687 | 1.3499 | 1.6093 | 0.4303 | 0.6783 |
+| steady_low_curvature | 537 | 0.3583 | 0.0378 | 0.1981 | 0.1441 | 0.0257 |
+| text_non_flat | 3584 | 1.2113 | 0.8370 | 1.0241 | 0.2901 | 0.4272 |
+| text_non_reused | 3584 | 1.2113 | 0.8370 | 1.0241 | 0.2901 | 0.4272 |
+| text_clean | 3584 | 1.2113 | 0.8370 | 1.0241 | 0.2901 | 0.4272 |
