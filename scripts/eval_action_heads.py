@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -413,7 +413,7 @@ def apply_ablation_inputs(
     planning_hidden: torch.Tensor,
     ego_history: Optional[torch.Tensor],
     ablation_mode: str,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if ablation_mode == "ego_only":
         planning_hidden = torch.zeros_like(planning_hidden)
     elif ablation_mode in ("vlm_only", "zero_history") and ego_history is not None:
