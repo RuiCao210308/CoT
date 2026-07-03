@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--speed_weight", type=float, default=1.0)
     parser.add_argument("--curvature_weight", type=float, default=1.0)
     parser.add_argument("--hidden_cache", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -194,6 +195,7 @@ def load_qwen_model_and_processor(model_path: str, device: str):
 
 def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
+    torch.manual_seed(int(args.seed))
     records = load_jsonl_records(args.jsonl)
     hidden_cache = load_hidden_cache(args.hidden_cache)
     samples, skipped = collect_samples(
@@ -312,6 +314,7 @@ def train(args):
             "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
             "hidden_cache": args.hidden_cache,
+            "seed": args.seed,
         },
         "train_action_schema": TRAIN_ACTION_SCHEMA,
         "source_action_schema": SOURCE_ACTION_SCHEMA,

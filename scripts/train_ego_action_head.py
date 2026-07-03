@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--speed_weight", type=float, default=1.0)
     parser.add_argument("--curvature_weight", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -92,6 +93,7 @@ def batch_iter(samples: List[Dict[str, torch.Tensor]], batch_size: int):
 
 def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
+    torch.manual_seed(int(args.seed))
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     records = load_records(args.jsonl)
     samples, skipped = collect_samples(records, args.max_samples)
@@ -151,6 +153,7 @@ def train(args):
             "speed_weight": args.speed_weight,
             "curvature_weight": args.curvature_weight,
             "target_curvature_scale": 100.0,
+            "seed": args.seed,
         },
         "source_action_schema": SOURCE_ACTION_SCHEMA,
         "train_action_schema": TRAIN_ACTION_SCHEMA,
